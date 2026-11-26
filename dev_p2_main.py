@@ -22,7 +22,22 @@ import sys
 import time
 from pathlib import Path
 
-from rakshak.contracts import DateMention, IdentityClues, PolicyConfig, PrivacyPlan, RecordUnit
+from rakshak.clue_extractor import extract_all_clues, infer_file_date_orders
+from rakshak.contracts import PolicyConfig, PrivacyPlan, RecordUnit
+from rakshak.linkage import link_records
+from rakshak.privacy import (
+    apply_privacy_to_fhir_bundle,
+    apply_privacy_to_structured_record,
+    apply_privacy_to_text,
+    build_privacy_plans,
+)
+from rakshak.security import (
+    EphemeralVault,
+    log_summary,
+    safe_error_reason,
+    sha256_hex,
+    write_release_manifests,
+)
 
 HERE = Path(__file__).resolve().parent
 POLICY = PolicyConfig.from_yaml(HERE / "config" / "policy.yaml")
@@ -113,6 +128,20 @@ def baseline_clean_value(v, stats: Stats):
     return v
 
 
+def _is_doc_json(data: object) -> bool:
+    if not isinstance(data, dict):
+        return True
+    if data.get("resourceType") == "Bundle":
+        return True
+    # Single-patient diagnostic reports (have top-level "patient" dict or "panels") or helpdesk/index docs
+    if isinstance(data.get("patient"), dict) or "panels" in data or "tickets" in data:
+        return True
+    return not any(
+        isinstance(v, list) and v and all(isinstance(x, dict) for x in v)
+        for v in data.values()
+    )
+
+
 def parse_file_units(rel: str, ext: str, text: str) -> tuple[str, object, list[RecordUnit]]:
     """Parse one decoded file into RecordUnits for Person 2's pipeline."""
     hosp = infer_hospital_hint(rel)
@@ -143,14 +172,7 @@ def parse_file_units(rel: str, ext: str, text: str) -> tuple[str, object, list[R
     if ext == ".json":
         data = json.loads(text)
         is_fhir = isinstance(data, dict) and data.get("resourceType") == "Bundle"
-        is_doc = (
-            not isinstance(data, dict)
-            or is_fhir
-            or not any(
-                isinstance(v, list) and v and all(isinstance(x, dict) for x in v)
-                for v in data.values()
-            )
-        )
+        is_doc = _is_doc_json(data)
         if is_doc:
             loc = "doc"
             units.append(
@@ -205,23 +227,21 @@ def parse_file_units(rel: str, ext: str, text: str) -> tuple[str, object, list[R
     return "txt", text, units
 
 
-def build_default_privacy_plans(
-    units: list[RecordUnit], policy: PolicyConfig, secret: bytes
-) -> dict[str, PrivacyPlan]:
-    """Phase 0 placeholder: returns unlinked plans (replaced in Phases 1-4)."""
-    plans: dict[str, PrivacyPlan] = {}
-    for u in units:
-        plans[u.unit_id] = PrivacyPlan(
-            unit_id=u.unit_id,
-            cluster_key=None,
-            pseudonym=None,
-            date_shift_days=make_date_shift_days(u.unit_id, secret, policy.date_shift_max_days),
-            age_band=None,
-            keep_district=True,
-            keep_pin_prefix=True,
-            generalization_level="standard",
-        )
-    return plans
+_ID_KEY_RE = re.compile(r"^(?:uhid|mrn|reg[_\s]*no|patient[_\s]*ref|patientid|patient_id|hospital_uhid)$", re.I)
+
+
+def _inject_pseudonym_json_obj(obj: dict, pid: str) -> None:
+    for k in list(obj.keys()):
+        if _ID_KEY_RE.match(k):
+            obj[k] = pid
+            return
+    for v in obj.values():
+        if isinstance(v, dict):
+            for k2 in list(v.keys()):
+                if _ID_KEY_RE.match(k2):
+                    v[k2] = pid
+                    return
+    obj["patient_ref"] = pid
 
 
 def render_sanitized(
@@ -229,62 +249,121 @@ def render_sanitized(
     parsed: object,
     rel: str,
     plans: dict[str, PrivacyPlan],
+    date_orders: dict[tuple[str, str], str],
     records_out: list[dict],
     stats: Stats,
 ) -> str:
+    is_clean_doc = rel.startswith("clean/") or rel == "misc/README_export.txt"
     if kind == "csv":
         delim, header, body = parsed  # type: ignore[misc]
         buf = io.StringIO()
         w = csv.writer(buf, delimiter=delim, lineterminator="\n")
         if header or body:
             w.writerow(header)
+        id_col = next((idx for idx, h in enumerate(header) if _ID_KEY_RE.match(h.strip())), None)
         for i, row in enumerate(body):
             loc = f"row:{i}"
             plan = plans[f"{rel}::{loc}"]
-            w.writerow([baseline_clean_text(c, stats) for c in row])
-            records_out.append({"file": f"sanitized/{rel}", "loc": loc, "patient": plan.pseudonym})
+            gen_changed = False
+            if not is_clean_doc and header:
+                row_dict = {header[j]: row[j] for j in range(min(len(header), len(row)))}
+                t_dict, gen_changed = apply_privacy_to_structured_record(row_dict, plan, rel, date_orders, POLICY)
+                priv_row = [str(t_dict.get(header[j], row[j])) if j < len(header) else row[j] for j in range(len(row))]
+            else:
+                priv_row = list(row)
+            cleaned_row = [baseline_clean_text(c, stats) for c in priv_row]
+            if plan.pseudonym is not None:
+                if id_col is not None and id_col < len(cleaned_row):
+                    cleaned_row[id_col] = plan.pseudonym
+                elif cleaned_row:
+                    cleaned_row[0] = f"{plan.pseudonym}"
+            w.writerow(cleaned_row)
+            rec_entry: dict = {"file": f"sanitized/{rel}", "loc": loc, "patient": plan.pseudonym}
+            if gen_changed:
+                rec_entry["status"] = "generalized"
+                stats.generalized += 1
+            records_out.append(rec_entry)
             stats.records += 1
             if plan.pseudonym is not None:
                 stats.linked += 1
         return buf.getvalue()
 
     if kind == "json":
-        data = parsed
-        is_doc = (
-            not isinstance(data, dict)
-            or data.get("resourceType") == "Bundle"
-            or not any(
-                isinstance(v, list) and v and all(isinstance(x, dict) for x in v)
-                for v in data.values()
-            )
-        )
+        is_fhir = isinstance(parsed, dict) and parsed.get("resourceType") == "Bundle"
+        is_doc = _is_doc_json(parsed)
         if is_doc:
             plan = plans[f"{rel}::doc"]
-            records_out.append({"file": f"sanitized/{rel}", "loc": "doc", "patient": plan.pseudonym})
+            gen_changed = False
+            working = parsed
+            if not is_clean_doc and isinstance(working, dict):
+                if is_fhir:
+                    import copy
+                    working, gen_changed = apply_privacy_to_fhir_bundle(copy.deepcopy(working), plan, POLICY)
+                else:
+                    working, gen_changed = apply_privacy_to_structured_record(working, plan, rel, date_orders, POLICY)
+            data = baseline_clean_value(working, stats)
+            if plan.pseudonym is not None and isinstance(data, dict):
+                if is_fhir:
+                    for entry in data.get("entry") or []:
+                        res = entry.get("resource") if isinstance(entry, dict) else None
+                        if isinstance(res, dict) and res.get("resourceType") == "Patient":
+                            res["identifier"] = [{"system": "urn:raksha:pseudonym", "value": plan.pseudonym}]
+                else:
+                    _inject_pseudonym_json_obj(data, plan.pseudonym)
+            rec_entry = {"file": f"sanitized/{rel}", "loc": "doc", "patient": plan.pseudonym}
+            if gen_changed:
+                rec_entry["status"] = "generalized"
+                stats.generalized += 1
+            records_out.append(rec_entry)
             stats.records += 1
             if plan.pseudonym is not None:
                 stats.linked += 1
-        else:
-            for k, v in data.items():  # type: ignore[union-attr]
+            return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+        # Multi-record JSON (opd, bulk_lab, dhh_patients)
+        import copy
+        working_root = copy.deepcopy(parsed)
+        if isinstance(working_root, dict):
+            for k, v in working_root.items():
                 if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
                     pointer_key = k.replace("~", "~0").replace("/", "~1")
-                    for i, _ in enumerate(v):
+                    for i, item in enumerate(v):
                         loc = f"/{pointer_key}/{i}"
                         plan = plans[f"{rel}::{loc}"]
-                        records_out.append(
-                            {"file": f"sanitized/{rel}", "loc": loc, "patient": plan.pseudonym}
-                        )
+                        gen_changed = False
+                        if not is_clean_doc:
+                            item, gen_changed = apply_privacy_to_structured_record(item, plan, rel, date_orders, POLICY)
+                            v[i] = item
+                        if plan.pseudonym is not None and isinstance(item, dict):
+                            _inject_pseudonym_json_obj(item, plan.pseudonym)
+                        rec_entry = {"file": f"sanitized/{rel}", "loc": loc, "patient": plan.pseudonym}
+                        if gen_changed:
+                            rec_entry["status"] = "generalized"
+                            stats.generalized += 1
+                        records_out.append(rec_entry)
                         stats.records += 1
                         if plan.pseudonym is not None:
                             stats.linked += 1
-        return json.dumps(baseline_clean_value(data, stats), ensure_ascii=False, indent=2) + "\n"
+        data = baseline_clean_value(working_root, stats)
+        return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
     plan = plans[f"{rel}::doc"]
-    records_out.append({"file": f"sanitized/{rel}", "loc": "doc", "patient": plan.pseudonym})
+    txt = str(parsed)
+    gen_changed = False
+    if not is_clean_doc:
+        txt, gen_changed = apply_privacy_to_text(txt, plan, date_orders.get((rel, "__doc__"), "dmy"))
+    rec_entry = {"file": f"sanitized/{rel}", "loc": "doc", "patient": plan.pseudonym}
+    if gen_changed:
+        rec_entry["status"] = "generalized"
+        stats.generalized += 1
+    records_out.append(rec_entry)
     stats.records += 1
     if plan.pseudonym is not None:
         stats.linked += 1
-    return baseline_clean_text(str(parsed), stats)
+    cleaned_txt = baseline_clean_text(txt, stats)
+    if plan.pseudonym is not None:
+        return f"Patient: {plan.pseudonym}\n{cleaned_txt}"
+    return cleaned_txt
 
 
 def peak_rss_mb() -> float:
@@ -305,9 +384,11 @@ def main() -> int:
     t0 = time.monotonic()
     inp, out = Path(args.input), Path(args.output)
     san = out / "sanitized"
+    quar_dir = out / "quarantine"
     san.mkdir(parents=True, exist_ok=True)
     sys.setrecursionlimit(5000)
 
+    vault = EphemeralVault()
     stats = Stats()
     file_entries: list[dict] = []
     parsed_files: list[tuple[str, str, object, int]] = []
@@ -316,7 +397,8 @@ def main() -> int:
     for path in sorted(p for p in inp.rglob("*") if p.is_file()):
         rel = path.relative_to(inp).as_posix()
         raw = path.read_bytes()
-        entry: dict = {"input_sha256": hashlib.sha256(raw).hexdigest()}
+        in_sha = sha256_hex(raw)
+        entry: dict = {"input_sha256": in_sha}
         ext = path.suffix.lower()
         try:
             if ext not in (".csv", ".tsv", ".json", ".txt"):
@@ -332,49 +414,36 @@ def main() -> int:
             parsed_files.append((rel, kind, parsed, idx))
             all_units.extend(units)
         except (ValueError, RecursionError, UnicodeError, csv.Error) as exc:
-            reason = (
-                str(exc)
-                if isinstance(exc, ValueError) and str(exc).isidentifier()
-                else type(exc).__name__
-            )
+            reason = safe_error_reason(exc)
+            vault.quarantine_file(quar_dir, in_sha, raw)
             entry.update(output=None, status="quarantined", reason=reason)
             file_entries.append(entry)
 
-    plans = build_default_privacy_plans(all_units, POLICY, SECRET)
+    date_orders = infer_file_date_orders(all_units)
+    clues = extract_all_clues(all_units)
+    cluster_map = link_records(clues)
+    plans = build_privacy_plans(clues, cluster_map, POLICY, SECRET)
 
     records_out: list[dict] = []
     for rel, kind, parsed, entry_idx in parsed_files:
-        rendered = render_sanitized(kind, parsed, rel, plans, records_out, stats)
+        rendered = render_sanitized(kind, parsed, rel, plans, date_orders, records_out, stats)
         dest = san / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(rendered, encoding="utf-8", newline="")
         file_entries[entry_idx].update(output=f"sanitized/{rel}", status="sanitized")
 
-    with open(out / "records.jsonl", "w", encoding="utf-8") as f:
-        for r in records_out:
-            f.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
-
-    n_san = sum(1 for e in file_entries if e.get("status") == "sanitized")
-    report = {
-        "schema": "raksha-report/1",
-        "files": file_entries,
-        "counts": {
-            "files_total": len(file_entries),
-            "files_sanitized": n_san,
-            "files_quarantined": len(file_entries) - n_san,
-            "records_processed": len(records_out),
-            "identifiers_detected": stats.identifiers,
-            "records_linked": stats.linked,
-            "records_generalized": stats.generalized,
-            "records_suppressed": stats.suppressed,
-            "records_quarantined": 0,
-        },
-        "timing": {"seconds": round(time.monotonic() - t0, 2)},
-        "resources": {"peak_rss_mb": peak_rss_mb()},
-    }
-    (out / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    # Only counts go to stdout (no PII, no RAKSHA_SECRET)
-    print(f"files {len(file_entries)} sanitized {n_san} quarantined {len(file_entries) - n_san} records {len(records_out)}")
+    report = write_release_manifests(
+        out_dir=out,
+        file_entries=file_entries,
+        records_out=records_out,
+        identifiers_detected=stats.identifiers,
+        records_generalized=stats.generalized,
+        records_suppressed=stats.suppressed,
+        records_quarantined=0,
+        elapsed_seconds=time.monotonic() - t0,
+        secret=SECRET,
+    )
+    log_summary(report)
     return 0
 
 
