@@ -1,282 +1,207 @@
 #!/usr/bin/env python3
-"""Secret Wards starter: a correct *skeleton*, not a solution.
+"""Secret Wards privacy firewall pipeline (Enma / Rakshak).
 
-It already does the boring, contract-critical parts right:
-  * walks every input file in a fixed order (deterministic output),
-  * decodes UTF-8 / UTF-8-BOM / UTF-16 / cp1252 and writes UTF-8,
-  * keeps CSV as CSV (same delimiter, same header), JSON as JSON (same structure),
-  * quarantines anything it cannot parse instead of copying it,
-  * writes report.json (SHA-256 per input file, honest counts, timing, memory),
-  * writes records.jsonl with the right locators (row:N, /json/pointer, doc),
-  * gives you keyed HMAC pseudonyms and per-patient date shifting helpers,
-  * never prints, logs or stores personal data or RAKSHA_SECRET.
-
-What it does NOT do is the actual challenge. Search for "TODO(team)".
-As shipped it is roughly the "naive regex" level: it passes CONTRACT OK and scores low.
-
-Usage: python main.py --input <input dir> --output <empty output dir>
-Standard library only, Python 3.10+.
+Orchestrates two-pass deterministic sanitization:
+  Pass 1: Ingest, strict decode, content-sniff, quarantine, and profile schemas -> RecordUnits
+  Plan  : Invoke Person 2 linkage & privacy planner (falls back safely when stubbed)
+  Pass 2: Context-aware multilingual redaction, quasi-identifier transformation,
+          FHIR R4 preservation, filename hygiene, and report/records serialization.
 """
 from __future__ import annotations
 
 import argparse
-import csv
-import datetime as dt
 import hashlib
 import hmac
-import io
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
-# --------------------------------------------------------------------------- policy
-def load_policy(path: Path) -> dict:
-    """Tiny `key: value` reader for config/policy.yaml (no PyYAML needed)."""
-    policy = {}
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.split("#", 1)[0].strip()
-            if ":" in line:
-                k, v = (x.strip() for x in line.split(":", 1))
-                policy[k] = int(v) if v.lstrip("-").isdigit() else v
-    return policy
-
+from rakshak.contracts import PolicyConfig, PrivacyPlan, RecordUnit
+from rakshak.detector import DetectionStats
+from rakshak.formats import build_record_units, render_sanitized_file
+from rakshak.ingest import IngestResult, QuarantineError, ingest_file
 
 HERE = Path(__file__).resolve().parent
-POLICY = load_policy(HERE / "config" / "policy.yaml")
-SECRET = os.environ.get("RAKSHA_SECRET", "").encode()  # never print or write this
 
 
-# --------------------------------------------------------------------------- pseudonyms & dates
-_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32: no I, L, O, U
+def _default_date_shift(key: str, secret: bytes, max_days: int) -> int:
+    digest = hmac.new(secret, b"shift|" + key.encode("utf-8"), hashlib.sha256).digest()
+    val = int.from_bytes(digest[:4], "big") % (2 * max_days) - max_days
+    return val if val != 0 else 1
 
 
-def pseudonym(patient_key: str) -> str:
-    """Stable, non-reversible ID: HMAC-SHA256 keyed with RAKSHA_SECRET (never a plain hash).
-
-    Same key + same secret -> same ID in every file. A different secret -> a different ID.
-    patient_key should be YOUR canonical identity for a cluster of records (see link_records).
-    """
-    digest = hmac.new(SECRET, patient_key.encode("utf-8"), hashlib.sha256).digest()
-    n = int.from_bytes(digest[:5], "big")
-    code = "".join(_ALPHABET[(n >> (5 * i)) & 31] for i in range(6))
-    return f"PSN-{code}"
-
-
-def date_shift_days(patient_key: str) -> int:
-    """Per-patient shift in [-max, +max], never 0. Shift every date of one patient by the
-    SAME amount and a 9-day stay stays 9 days."""
-    m = int(POLICY.get("date_shift_max_days", 180))
-    d = hmac.new(SECRET, b"shift|" + patient_key.encode("utf-8"), hashlib.sha256).digest()
-    v = int.from_bytes(d[:4], "big") % (2 * m) - m
-    return v if v != 0 else 1
-
-
-def shift_date(value: dt.date, patient_key: str) -> dt.date:
-    return value + dt.timedelta(days=date_shift_days(patient_key))
+def _fallback_privacy_plans(
+    units: list[RecordUnit],
+    policy: PolicyConfig,
+    secret: bytes,
+) -> dict[str, PrivacyPlan]:
+    """Person-1 standalone fallback until Person 2 linkage + privacy modules plug in."""
+    plans: dict[str, PrivacyPlan] = {}
+    for u in units:
+        plans[u.unit_id] = PrivacyPlan(
+            unit_id=u.unit_id,
+            cluster_key=None,
+            pseudonym=None,
+            date_shift_days=_default_date_shift(u.unit_id, secret, policy.date_shift_max_days),
+            age_band=None,
+            keep_district=True,
+            keep_pin_prefix=True,
+            generalization_level="standard",
+        )
+    return plans
 
 
-def age_band(age: int) -> str:
-    """5-year bands by default; the band must CONTAIN the true age."""
-    w = int(POLICY.get("age_band_years", 5))
-    lo = (age // w) * w
-    return f"{lo}-{lo + w - 1}"
+def _resolve_planner() -> Callable[[list[RecordUnit], PolicyConfig, bytes], dict[str, PrivacyPlan]]:
+    """Use Person 2's planner if implemented, otherwise fallback safely."""
+    try:
+        from rakshak import privacy as p2_privacy
 
-
-# --------------------------------------------------------------------------- detection
-# TODO(team): this is the part that wins or loses the event. Ideas, in rough order of value:
-#   * column-aware rules: a column named like a name/phone/address is PII whatever it contains
-#     (but expect renamed columns on hidden data: "Patient's Name", "Gram/Mohalla", ...);
-#   * a name gazetteer in Latin AND Devanagari, transliteration (Mohammad/Mohd/Md./मोहम्मद),
-#     honorifics (ji, sahab, didi, श्री), relatives (S/o, D/o, W/o, C/O <name>);
-#   * the meaning traps: "C/O fever" is a complaint, "Dr. Ramesh" stays, "Dolo 650", "5 mg",
-#     "1-0-1" are doses, "Parkinson's disease" is not a person;
-#   * JSON keys, CSV headers, file names and base64 attachments can all hold PII.
-PATTERNS = [
-    ("PHONE", re.compile(r"(?<!\d)(?:\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?!\d)")),
-    ("AADHAAR", re.compile(r"(?<!\d)\d{4}[\s-]?\d{4}[\s-]?\d{4}(?!\d)")),
-    ("EMAIL", re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")),
-    ("PAN", re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")),
-    ("NAME", re.compile(r"(?i)(?<=name:)\s*[^\n,;|]+")),
-]
-
-
-class Stats:
-    identifiers = 0
-    records = 0
-    linked = 0
-    generalized = 0
-    suppressed = 0
-
-
-def clean_text(text: str) -> str:
-    """Replace detected identifiers with typed placeholders. TODO(team): much more than regex."""
-    for kind, rx in PATTERNS:
-        text, n = rx.subn(f"[{kind}]" if kind != "NAME" else " [NAME]", text)
-        Stats.identifiers += n
-    return text
-
-
-def clean_value(v):
-    if isinstance(v, str):
-        return clean_text(v)
-    if isinstance(v, list):
-        return [clean_value(x) for x in v]
-    if isinstance(v, dict):
-        # JSON keys can be PII too (for example a dict keyed by patient name)
-        return {clean_text(k): clean_value(x) for k, x in v.items()}
-    return v  # numbers, booleans, null keep their type
-
-
-# --------------------------------------------------------------------------- linkage
-def link_records(_record_text: str):
-    """Return a canonical patient key for a record, or None when the evidence is too weak.
-
-    TODO(team): blocking + fuzzy/phonetic + cross-script matching across ALL files, then cluster
-    without transitive over-merging. Two different people with the same name must stay apart.
-    A wrong link costs more than no link, so the starter links nothing.
-    """
-    return None
-
-
-# --------------------------------------------------------------------------- I/O
-def decode(raw: bytes) -> str | None:
-    if raw.startswith(b"\xef\xbb\xbf"):
-        return raw[3:].decode("utf-8", errors="strict")
-    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return raw.decode("utf-16")
-    for enc in ("utf-8", "cp1252"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return None
-
-
-def process_csv(text: str, delimiter: str, rel: str, records: list) -> str:
-    rows = list(csv.reader(io.StringIO(text, newline=""), delimiter=delimiter))
-    if not rows:
-        return ""
-    header, body = rows[0], rows[1:]
-    buf = io.StringIO()
-    w = csv.writer(buf, delimiter=delimiter, lineterminator="\n")
-    w.writerow(header)  # TODO(team): rename a header only if it contains PII
-    for i, row in enumerate(body):
-        key = link_records(delimiter.join(row))
-        pid = pseudonym(key) if key else None
-        # TODO(team): write pid into the row's patient column so it appears INSIDE the record
-        w.writerow([clean_text(c) for c in row])
-        records.append({"file": f"sanitized/{rel}", "loc": f"row:{i}", "patient": pid})
-        Stats.records += 1
-        Stats.linked += pid is not None
-    return buf.getvalue()
-
-
-def process_json(text: str, rel: str, records: list) -> str:
-    data = json.loads(text)
-    is_doc = not isinstance(data, dict) or data.get("resourceType") == "Bundle" or not any(
-        isinstance(v, list) and v and all(isinstance(x, dict) for x in v) for v in data.values())
-    if is_doc:  # FHIR Bundle or single object: one record for the whole file
-        records.append({"file": f"sanitized/{rel}", "loc": "doc", "patient": None})
-        Stats.records += 1
-    else:
-        for k, v in data.items():
-            if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
-                for i, _ in enumerate(v):
-                    pointer_key = k.replace("~", "~0").replace("/", "~1")
-                    records.append({"file": f"sanitized/{rel}", "loc": f"/{pointer_key}/{i}", "patient": None})
-                    Stats.records += 1
-    # TODO(team): FHIR must stay a valid R4 Bundle whose references resolve
-    return json.dumps(clean_value(data), ensure_ascii=False, indent=2) + "\n"
-
-
-def process_text(text: str, rel: str, records: list) -> str:
-    records.append({"file": f"sanitized/{rel}", "loc": "doc", "patient": None})
-    Stats.records += 1
-    return clean_text(text)
+        fn = getattr(p2_privacy, "build_privacy_plans", None)
+        if callable(fn):
+            return fn
+    except Exception:  # noqa: BLE001
+        pass
+    return _fallback_privacy_plans
 
 
 def peak_rss_mb() -> float:
     try:
         import resource
+
         r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         return round(r / 1024 if sys.platform != "darwin" else r / 1048576, 1)
-    except Exception:  # noqa: BLE001 - not available on every OS
+    except Exception:  # noqa: BLE001
         return 0.0
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Secret Wards starter pipeline")
-    ap.add_argument("--input", required=True)
-    ap.add_argument("--output", required=True)
-    a = ap.parse_args()
+def run_pipeline(
+    inp: Path,
+    out: Path,
+    policy: PolicyConfig,
+    secret: bytes,
+    plan_fn: Callable[[list[RecordUnit], PolicyConfig, bytes], dict[str, PrivacyPlan]] | None = None,
+) -> dict:
+    """Execute the complete two-pass privacy firewall pipeline."""
     t0 = time.monotonic()
-    inp, out = Path(a.input), Path(a.output)
     san = out / "sanitized"
     san.mkdir(parents=True, exist_ok=True)
-    files, records = [], []
-    sys.setrecursionlimit(5000)
+
+    file_entries: list[dict] = []
+    ingested: list[tuple[IngestResult, dict, int]] = []
+    all_units: list[RecordUnit] = []
+    seen_out_paths: set[str] = set()
 
     for path in sorted(p for p in inp.rglob("*") if p.is_file()):
         rel = path.relative_to(inp).as_posix()
-        raw = path.read_bytes()
-        entry = {"input_sha256": hashlib.sha256(raw).hexdigest()}
-        ext = path.suffix.lower()
         try:
-            if ext not in (".csv", ".tsv", ".json", ".txt"):
-                raise ValueError("unsupported_format")
-            if not raw.strip():
-                raise ValueError("empty_file")
-            text = decode(raw)
-            if text is None:
-                raise ValueError("undecodable_text")
-            # TODO(team): a file NAME can contain PII: rename it and report the new path
-            if ext in (".csv", ".tsv"):
-                result = process_csv(text, "\t" if ext == ".tsv" else ",", rel, records)
-            elif ext == ".json":
-                result = process_json(text, rel, records)
-            else:
-                result = process_text(text, rel, records)
-            dest = san / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(result, encoding="utf-8", newline="")
-            entry.update(output=f"sanitized/{rel}", status="sanitized")
-        except (ValueError, RecursionError, UnicodeError, csv.Error) as exc:
-            # Fail safe: never copy what we could not clean. The reason holds no file content.
-            reason = str(exc) if isinstance(exc, ValueError) and str(exc).isidentifier() else type(exc).__name__
-            entry.update(output=None, status="quarantined", reason=reason)
-        files.append(entry)
+            item = ingest_file(path, inp, secret)
+            # Guard against rare filename collision after sanitization
+            out_rel = item.clean_rel
+            if out_rel in seen_out_paths:
+                stem = Path(out_rel).stem
+                ext = Path(out_rel).suffix
+                parent = Path(out_rel).parent.as_posix()
+                suffix_hash = hmac.new(secret, rel.encode("utf-8"), hashlib.sha256).hexdigest()[:6]
+                out_rel = f"{parent}/{stem}_{suffix_hash}{ext}" if parent != "." else f"{stem}_{suffix_hash}{ext}"
+                item = IngestResult(
+                    file_rel=item.file_rel,
+                    sha256=item.sha256,
+                    ext=item.ext,
+                    format_type=item.format_type,
+                    text=item.text,
+                    parsed=item.parsed,
+                    hospital_hint=item.hospital_hint,
+                    clean_rel=out_rel,
+                    filename_renamed=True,
+                )
+            seen_out_paths.add(out_rel)
+            units, ctx = build_record_units(item)
+            entry_idx = len(file_entries)
+            file_entries.append({"input_sha256": item.sha256})
+            ingested.append((item, ctx, entry_idx))
+            all_units.extend(units)
+        except QuarantineError as exc:
+            raw_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            file_entries.append(
+                {
+                    "input_sha256": raw_sha,
+                    "output": None,
+                    "status": "quarantined",
+                    "reason": exc.reason,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - fail-safe quarantine without leaking content
+            raw_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            file_entries.append(
+                {
+                    "input_sha256": raw_sha,
+                    "output": None,
+                    "status": "quarantined",
+                    "reason": type(exc).__name__,
+                }
+            )
 
-    # Records whose file ended up quarantined must not be listed
-    exported = {e["output"] for e in files if e["output"]}
-    records = [r for r in records if r["file"] in exported]
+    planner = plan_fn or _resolve_planner()
+    plans = planner(all_units, policy, secret)
+
+    stats = DetectionStats()
+    records_out: list[dict] = []
+    for item, ctx, entry_idx in ingested:
+        rendered = render_sanitized_file(item, ctx, plans, records_out, stats)
+        dest = san / item.clean_rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(rendered, encoding="utf-8", newline="")
+        file_entries[entry_idx].update(output=f"sanitized/{item.clean_rel}", status="sanitized")
 
     with open(out / "records.jsonl", "w", encoding="utf-8") as f:
-        for r in records:
+        for r in records_out:
             f.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
 
-    n_san = sum(e["status"] == "sanitized" for e in files)
+    n_san = sum(1 for e in file_entries if e.get("status") == "sanitized")
+    n_gen = sum(1 for r in records_out if r.get("status") == "generalized")
+    n_sup = sum(1 for r in records_out if r.get("status") == "suppressed")
     report = {
         "schema": "raksha-report/1",
-        "files": files,
+        "files": file_entries,
         "counts": {
-            "files_total": len(files), "files_sanitized": n_san, "files_quarantined": len(files) - n_san,
-            "records_processed": len(records), "identifiers_detected": Stats.identifiers,
-            "records_linked": sum(r["patient"] is not None for r in records),
-            "records_generalized": Stats.generalized, "records_suppressed": Stats.suppressed,
+            "files_total": len(file_entries),
+            "files_sanitized": n_san,
+            "files_quarantined": len(file_entries) - n_san,
+            "records_processed": len(records_out),
+            "identifiers_detected": stats.identifiers,
+            "records_linked": sum(1 for r in records_out if r.get("patient") is not None),
+            "records_generalized": max(n_gen, stats.generalized),
+            "records_suppressed": n_sup,
             "records_quarantined": 0,
         },
+        "entities": dict(sorted(stats.by_type.items())),
         "timing": {"seconds": round(time.monotonic() - t0, 2)},
         "resources": {"peak_rss_mb": peak_rss_mb()},
     }
     (out / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    # Only counts go to stdout: stdout and stderr are scanned for PII.
-    print(f"files {len(files)} sanitized {n_san} quarantined {len(files) - n_san} records {len(records)}")
+    return report
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Enma / Secret Wards privacy firewall")
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output", required=True)
+    args = ap.parse_args()
+
+    policy = PolicyConfig.from_yaml(HERE / "config" / "policy.yaml")
+    secret = os.environ.get("RAKSHA_SECRET", "").encode("utf-8")
+    report = run_pipeline(Path(args.input), Path(args.output), policy, secret)
+    c = report["counts"]
+    # Strict side-channel rule: only aggregate counts on stdout
+    print(
+        f"files {c['files_total']} sanitized {c['files_sanitized']} "
+        f"quarantined {c['files_quarantined']} records {c['records_processed']}"
+    )
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
