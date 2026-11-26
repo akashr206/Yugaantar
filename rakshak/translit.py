@@ -1,4 +1,4 @@
-"""Cross-script transliteration, phonetic normalization, and ID canonicalization. [Person 2]
+"""Cross-script transliteration, phonetic normalization, and ID canonicalization.
 
 Unifies English, Devanagari Hindi, and Hinglish surface forms into canonical
 Latin tokens and phonetic keys without relying on memorized dev-set names.

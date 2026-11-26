@@ -1,4 +1,4 @@
-"""Multilingual & context-aware PII detector with meaning-trap shields. [Person 1]"""
+"""Multilingual & context-aware PII detector with meaning-trap shields."""
 from __future__ import annotations
 
 import re
@@ -65,6 +65,8 @@ _COMPLAINT_WORDS = (
 )
 
 _SHIELD_PATTERNS: list[re.Pattern[str]] = [
+    # RFC 4122 UUIDs and urn:uuid references (FHIR identifiers/references) - never strip segments as Aadhaar/Phone
+    re.compile(r"(?:urn:uuid:)?\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"),
     # Doctors (English + Devanagari) - never cross newlines!
     re.compile(r"\bDr\.[ \t]+[A-Z][a-zA-Z.'-]*(?:[ \t]+[A-Z][a-zA-Z.'-]*){0,3}(?:[ \t]*\([^)\n]{1,40}\))?"),
     re.compile(r"डॉ\.[ \t]*[^\s\n]+(?:[ \t]+[^\s\n]+){0,2}"),
@@ -92,7 +94,10 @@ _SHIELD_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b[0-2]-[0-2]-[0-2]\b(?:[ \t]*x[ \t]*\d+[ \t]*(?:days?|wks?|weeks?|months?))?"),
     re.compile(r"(?i)\b\d+(?:\.\d+)?[ \t]*(?:mg/dL|g/dL|mg|mcg|ug|gm|g|mL|ml|IU|/uL|mmHg|U/L|mIU/L|°F)\b"),
     re.compile(r"(?i)\b(?:BP[ \t]*\d{2,3}/\d{2,3}|Pulse[ \t]*\d{2,3}(?:/min)?|SpO2[ \t]*\d{2,3}%|Temp[ \t]*\d{2,3}(?:\.\d+)?[ \t]*°?F)\b"),
-    re.compile(r"(?<![A-Za-z0-9./-])(?![6-9]\d{4}-\d{5})\d+(?:\.\d+)?-\d+(?:\.\d+)?(?![A-Za-z0-9.-])"),
+    re.compile(
+        r"(?<![A-Za-z0-9./+\-])(?![6-9]\d{4}-\d{5})(?!91-[6-9]\d{9})(?!\d{4}-\d{4}-\d{4})"
+        r"\d{1,6}(?:\.\d+)?-\d{1,6}(?:\.\d+)?(?![A-Za-z0-9.\-])"
+    ),
     re.compile(r"(?i)\b(?:x[ \t]*\d+[ \t]*(?:days?|wks?|weeks?|months?|yrs?)|for[ \t]+\d+[ \t]+(?:days?|wks?|weeks?|months?|yrs?))\b"),
     # ICD-10 and package codes
     re.compile(r"\b[A-TV-Z]\d{2}(?:\.\d{1,2})?\b"),
@@ -103,11 +108,12 @@ _SHIELD_PATTERNS: list[re.Pattern[str]] = [
 _DIRECT_ID_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("ABHA_ADDRESS", re.compile(r"[\w.+-]+@(?:abdm|sbx)\b", re.I)),
     ("EMAIL", re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")),
+    ("UPI_ID", re.compile(r"\b[\w.+-]{2,}@(?:ok(?:icici|hdfcbank|axisbank|sbi)|ybl|ibl|axl|paytm|upi)\b", re.I)),
     ("ABHA_NUMBER", re.compile(r"(?<!\d)91[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}(?!\d)")),
     ("AADHAAR_MASKED", re.compile(r"(?i)(?<![A-Za-z0-9])[X*]{4}[\s-]?[X*]{4}[\s-]?\d{4}(?!\d)")),
-    ("AADHAAR", re.compile(r"(?<!\d)\d{4}[\s-]?\d{4}[\s-]?\d{4}(?!\d)")),
+    ("AADHAAR", re.compile(r"(?<!\d)(?:\(\d{4}\)|\d{4})[\s-]?\d{4}[\s-]?\d{4}(?!\d)")),
     ("PHONE", re.compile(r"(?<!\d)(?:\+?91[\s-]?)?0?[6-9]\d{4}[\s-]?\d{5}(?!\d)")),
-    ("PAN", re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")),
+    ("PAN", re.compile(r"(?i)\b[A-Z]{5}[ \t]?\d{4}[ \t]?[A-Z]\b")),
     ("INSURANCE_ID", re.compile(r"\b(?:PMJAY-[A-Z]{2}-\d+|POL/\d+/\d+)\b")),
     (
         "MRN",
@@ -118,9 +124,10 @@ _DIRECT_ID_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ),
 ]
 
-# Labeled ID fallback for unseen hospital prefixes (group 1 = ID value)
+# Labeled ID fallback for unseen hospital prefixes (group 2 = ID value)
 _LABELED_ID_RX = re.compile(
-    r"(?i)((?:UHID|IPD\s*No|Reg\.?\s*No|MRN|Patient\s*ID|पंजीकरण\s*सं\.|आईपीडी\s*सं\.)[:\s]\s*)([A-Za-z0-9/_-]{4,24})"
+    r"(?i)((?:UHID|IPD\s*No\.?|Reg\.?\s*No\.?|Patient\s*No\.?|NHS\s*No\.?|MRN|Patient\s*ID|पंजीकरण\s*सं\.?|आईपीडी\s*सं\.?)[:\s]\s*)"
+    r"([A-Za-z0-9/_-]{4,24}|\d{3,4}[ \t]\d{3,4}[ \t]\d{3,4})"
 )
 
 # --------------------------------------------------------------------------- Stage 3: Context-Anchored Names & Addresses
@@ -135,7 +142,7 @@ _LABELED_NAME_PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
     (
         "PATIENT_NAME",
         re.compile(
-            r"(?im)((?:Patient\s*Name|Pt\.?\s*Name|Name|Beneficiary\s*Name)\s*:\s*)"
+            r"(?im)((?:Patient\s*Name|Pt\.?\s*Name|Applicant\s*Name|Account\s*Holder|Beneficiary(?:\s*Name)?|Name)\s*:\s*)"
             r"([^\n,;|()]+?)(?=\s{2,}(?:Age|Sex|UHID|IPD|Reg|Mobile|Mob)|\s*(?:Age/Sex|Age|UHID|IPD)\s*:|\n|$)"
         ),
         2,
@@ -287,6 +294,12 @@ def _unshield_text(text: str, shields: list[str]) -> str:
     return text
 
 
+_COMMA_VILLAGE_RX = re.compile(r"(?m),[ \t]*([^,\n\[\]]{3,35}?)(?=[ \t]*,[ \t]*\[TEHSIL\])")
+_SUPPRESS_DIST_EN_RX = re.compile(r"(?i)\bDistt?\.?[ \t]+[A-Za-z]+(?:[ \t]+[A-Za-z]+){0,2}(?=[ \t]*(?:,|-|\n|$))")
+_SUPPRESS_DIST_HI_RX = re.compile(r"जिला[ \t]+(?!(?:अस्पताल|चिकित्सालय)\b)[\u0900-\u097F]+(?:[ \t]+[\u0900-\u097F]+){0,1}")
+_FAST_SAFE_TOKEN_RX = re.compile(r"^[A-Za-z_-]{1,36}$")
+
+
 def _apply_shadow_sub(
     text: str,
     rx: re.Pattern[str],
@@ -296,7 +309,7 @@ def _apply_shadow_sub(
     group_idx: int = 0,
 ) -> str:
     """Run regex on 1:1 Devanagari-digit-normalized shadow string and splice original."""
-    shadow = text.translate(_DEVA_DIGITS)
+    shadow = text if text.isascii() else text.translate(_DEVA_DIGITS)
     matches = list(rx.finditer(shadow))
     if not matches:
         return text
@@ -335,14 +348,14 @@ def clean_free_text(
     hospital_hint: str = "",
 ) -> str:
     """Detect and redact PII in free text while protecting clinical meaning traps."""
-    if not text:
+    if not text or _FAST_SAFE_TOKEN_RX.fullmatch(text):
         return text
 
     if clean_only_direct_ids:
-        res = text
-        for kind, rx in _DIRECT_ID_PATTERNS[:7]:  # email, abha, aadhaar, phone, pan, insurance
+        res, direct_shields = _shield_text(text)
+        for kind, rx in _DIRECT_ID_PATTERNS[:9]:  # email, upi, abha, aadhaar, phone, pan, insurance
             res = _apply_shadow_sub(res, rx, kind, stats)
-        return res
+        return _unshield_text(res, direct_shields)
 
     # 1. Shield protected clinical expressions first
     work, shields = _shield_text(text)
@@ -369,7 +382,7 @@ def clean_free_text(
     # Unprefixed village sitting directly before ", [TEHSIL]" in Address lines
     work = _apply_shadow_sub(
         work,
-        re.compile(r"(?m),[ \t]*([^,\n\[\]]{3,35}?)(?=[ \t]*,[ \t]*\[TEHSIL\])"),
+        _COMMA_VILLAGE_RX,
         "VILLAGE",
         stats,
         group_idx=1,
@@ -384,10 +397,18 @@ def clean_free_text(
     work = _apply_shadow_sub(work, _PIN_IN_ADDRESS_RX, "PIN", stats, replacement_fn=_pin_rep, group_idx=1)
     work = _apply_shadow_sub(work, _STANDALONE_PIN_RX, "PIN", stats, replacement_fn=_pin_rep, group_idx=1)
 
-    # 5. Shift clinical dates and generalize ages in free text when PrivacyPlan is supplied
+    # 5. Shift clinical dates, generalize ages, and suppress district/DOB when required by PrivacyPlan
     if plan is not None:
-        # Unshield first? No — dates/ages are outside shielded med doses/ranges, except let's apply before unshielding so lab ranges 12.0-16.0 stay shielded!
-        work = shift_dates_in_text(work, plan.date_shift_days, hospital_hint=hospital_hint, is_suppressed=(plan.generalization_level == "suppressed"))
+        if not plan.keep_district:
+            work = _SUPPRESS_DIST_EN_RX.sub("[DISTRICT]", work)
+            work = _SUPPRESS_DIST_HI_RX.sub("[DISTRICT]", work)
+        work = shift_dates_in_text(
+            work,
+            plan.date_shift_days,
+            hospital_hint=hospital_hint,
+            is_suppressed=(plan.generalization_level != "standard"),
+        )
+        work = _shift_month_name_dates(work, plan.date_shift_days)
         work = generalize_ages_in_text(work, plan)
 
     # 6. Restore protected clinical spans
@@ -425,8 +446,8 @@ def shift_dates_in_text(
         parts = re.split(r"[-/.]", tok)
         if len(parts) != 3:
             return tok
-        # Guard short ranges like 12-16
-        if len(parts[2]) == 2 and int(parts[2]) < 20:
+        # Guard ambiguous non-ISO 2-digit year tokens with year < 20 (skip YYYY-MM-DD where parts[2] is day 01..19)
+        if len(parts[0]) != 4 and len(parts[2]) == 2 and int(parts[2]) < 20:
             return tok
         parsed = parse_date_string(tok, preferred_order=preferred)
         if parsed is None or not (1900 <= parsed.year <= 2035):
@@ -447,6 +468,13 @@ def shift_dates_in_text(
         return f"{shifted.month:02d}{sep}{shifted.day:02d}{sep}{yr}"
 
     return date_rx.sub(_repl, shadow)
+
+
+def _shift_month_name_dates(text: str, shift_days: int) -> str:
+    """Shift textual dates such as '5 September' cleanly using privacy.shift_date_token."""
+    from rakshak.privacy import _TEXT_MONTH_DATE_RE, shift_date_token
+
+    return _TEXT_MONTH_DATE_RE.sub(lambda m: shift_date_token(m.group(0), shift_days), text)
 
 
 def generalize_ages_in_text(text: str, plan: PrivacyPlan) -> str:
@@ -521,9 +549,9 @@ def sanitize_structured_cell(
         stats.add("INSURANCE_ID")
         return "[INSURANCE_ID]"
     if role == ROLE_MRN:
-        # If this column holds the patient's primary UHID/MRN/patient_ref, inject PSN if linked
+        # Inject linked pseudonym into primary hospital/patient ID cells (including unseen chaos prefixes)
         stats.add("MRN")
-        if plan and plan.pseudonym and any(k in norm_val.upper() for k in ("SNJ", "JJH", "UHID", "DHH", "ADM", "IPD")):
+        if plan and plan.pseudonym and re.search(r"[A-Za-z]{2,8}[/-]?\d{3,}", norm_val):
             return plan.pseudonym
         return "[MRN]"
     if role == ROLE_HOUSE:
@@ -557,7 +585,7 @@ def sanitize_structured_cell(
         return "[PIN]"
     if role == ROLE_DOB:
         stats.add("DOB")
-        if is_suppressed:
+        if plan is not None and plan.generalization_level != "standard":
             return "[DOB]"
         parsed = parse_date_string(norm_val, preferred_order=date_order)
         if parsed and plan is not None:
@@ -572,6 +600,8 @@ def sanitize_structured_cell(
             return shift_dates_in_text(value, plan.date_shift_days, hospital_hint=hospital_hint, is_suppressed=is_suppressed)
         return value
     if role == ROLE_AGE:
+        if norm_val.lstrip().startswith("-"):
+            return value
         digits = re.sub(r"[^\d]", "", norm_val.translate(_DEVA_DIGITS))
         if digits and plan is not None:
             stats.generalized += 1
@@ -606,7 +636,8 @@ def sanitize_structured_cell(
         # Full composite address string: redact house/locality/landmark/village/relative/PIN, keep district if allowed
         cleaned = clean_free_text(value, stats, plan=plan, hospital_hint=hospital_hint)
         if plan and not plan.keep_district:
-            cleaned = re.sub(r"(?i)\bDistt?\.?\s+[A-Za-z\s]+", "[DISTRICT]", cleaned)
+            cleaned = _SUPPRESS_DIST_EN_RX.sub("[DISTRICT]", cleaned)
+            cleaned = _SUPPRESS_DIST_HI_RX.sub("[DISTRICT]", cleaned)
         return cleaned
 
     return clean_free_text(value, stats, plan=plan, hospital_hint=hospital_hint)

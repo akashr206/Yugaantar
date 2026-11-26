@@ -1,4 +1,4 @@
-"""Precision-first cross-document identity resolution and clustering. [Person 2]
+"""Precision-first cross-document identity resolution and clustering.
 
 Uses deterministic blocking, tiered hard/composite evidence scoring, and
 anti-transitive cluster consistency guards to link records across scripts

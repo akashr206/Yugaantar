@@ -1,4 +1,4 @@
-"""Format-preserving & FHIR R4 sanitized writers and RecordUnit builders. [Person 1]"""
+"""Format-preserving & FHIR R4 sanitized writers and RecordUnit builders."""
 from __future__ import annotations
 
 import csv
@@ -6,6 +6,7 @@ import datetime as dt
 import io
 import json
 import re
+from functools import lru_cache
 from typing import Any
 
 from rakshak.contracts import DateMention, PrivacyPlan, RecordUnit
@@ -117,8 +118,19 @@ def _extract_json_dates_from_obj(obj: dict[str, Any], hospital_hint: str) -> tup
     return tuple(mentions)
 
 
+def _is_doc_json_container(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return True
+    if data.get("resourceType") == "Bundle":
+        return True
+    # Single-patient diagnostic reports (have top-level "patient" dict or "panels") or helpdesk docs
+    if isinstance(data.get("patient"), dict) or "panels" in data or "tickets" in data:
+        return True
+    return not any(isinstance(v, list) and v and all(isinstance(x, dict) for x in v) for v in data.values())
+
+
 def build_record_units(item: IngestResult) -> tuple[list[RecordUnit], dict[str, Any]]:
-    """Build RecordUnit objects and Person-1 file context from an IngestResult."""
+    """Build RecordUnit objects and file profiling context from an IngestResult."""
     rel = item.file_rel
     clean_doc = is_clean_reference_file(rel, item.format_type, item.parsed, item.text)
     units: list[RecordUnit] = []
@@ -148,13 +160,7 @@ def build_record_units(item: IngestResult) -> tuple[list[RecordUnit], dict[str, 
 
     if item.format_type in ("json", "fhir"):
         data = item.parsed
-        is_fhir = item.format_type == "fhir"
-        is_doc = (
-            not isinstance(data, dict)
-            or is_fhir
-            or "tickets" in data  # helpdesk_tickets.json is scored at doc level
-            or not any(isinstance(v, list) and v and all(isinstance(x, dict) for x in v) for v in data.values())
-        )
+        is_doc = _is_doc_json_container(data)
         ctx["is_doc"] = is_doc
         if is_doc:
             loc = "doc"
@@ -267,6 +273,19 @@ def _sanitize_json_scalar(
     if not isinstance(val, str):
         return val
 
+    # Semantic overrides for nested JSON person/guardian sub-fields
+    if low_parent == "name" and low_key == "local":
+        return sanitize_structured_cell(val, ROLE_PATIENT_NAME, "dmy", plan, stats, hospital_hint=hospital_hint)
+    if low_parent == "guardian" and low_key == "name":
+        return sanitize_structured_cell(val, ROLE_RELATIVE_NAME, "dmy", plan, stats, hospital_hint=hospital_hint)
+
+    # Protect structural UUIDs/URNs/HTTP ontology URLs from ID-regex corruption
+    if low_key in ("reference", "fullurl", "system", "url", "code", "version", "id", "profile") and re.fullmatch(
+        r"(?:urn:uuid:[0-9a-fA-F-]{36}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|https?://\S+)",
+        val.strip(),
+    ):
+        return val
+
     # Base64 attachments (e.g. scanned_consent_form.json, FHIR DocumentReference)
     decoded_b64 = try_decode_base64_text(val)
     if decoded_b64 is not None:
@@ -292,6 +311,16 @@ def _sanitize_json_scalar(
     return clean_free_text(val, stats, plan=plan, hospital_hint=hospital_hint)
 
 
+@lru_cache(maxsize=4096)
+def _clean_json_key_cached(k: str, hospital_hint: str) -> tuple[str, tuple[tuple[str, int], ...]]:
+    tmp_stats = DetectionStats()
+    c = clean_free_text(k, tmp_stats, plan=None, hospital_hint=hospital_hint)
+    if c == k and re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}", k.strip()):
+        tmp_stats.add("PATIENT_NAME")
+        c = "[PATIENT_NAME]"
+    return c, tuple(tmp_stats.by_type.items())
+
+
 def _sanitize_json_iterative(
     root: Any,
     plan: PrivacyPlan | None,
@@ -303,12 +332,9 @@ def _sanitize_json_iterative(
     def _clean_key(k: str) -> str:
         if clean_doc:
             return k
-        # Detect PII inside dict keys (e.g. patient_index.json by_uhid / by_name)
-        c = clean_free_text(k, stats, plan=None, hospital_hint=hospital_hint)
-        # If key looks like "First Last" inside an index dict (e.g. by_name), redact it
-        if c == k and re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}", k.strip()):
-            stats.add("PATIENT_NAME")
-            return "[PATIENT_NAME]"
+        c, stat_items = _clean_json_key_cached(k, hospital_hint)
+        for kind, cnt in stat_items:
+            stats.add(kind, cnt)
         return c
 
     if not isinstance(root, (dict, list)):
@@ -414,6 +440,20 @@ def _sanitize_fhir_bundle(
             # Replace Patient.name cleanly (catches HumanName text/given/family)
             stats.add("PATIENT_NAME")
             res["name"] = [{"text": psn or "[PATIENT_NAME]"}]
+            # Scrub Patient.telecom explicitly so +91- phones/emails never survive
+            if isinstance(res.get("telecom"), list):
+                for tc in res["telecom"]:
+                    if isinstance(tc, dict) and isinstance(tc.get("value"), str):
+                        sys_low = str(tc.get("system", "")).lower()
+                        kind = "EMAIL" if sys_low == "email" or "@" in tc["value"] else "PHONE"
+                        stats.add(kind)
+                        tc["value"] = f"[{kind}]"
+            # Suppress Patient.birthDate by omitting the optional element on widened/suppressed tiers (keeps valid FHIR R4)
+            if "birthDate" in res and (
+                plan.generalization_level != "standard"
+                or not re.fullmatch(r"\d{4}(?:-\d{2}(?:-\d{2})?)?", str(res["birthDate"]))
+            ):
+                res.pop("birthDate", None)
             # Sanitize narrative div cleanly
             txt = res.get("text")
             if isinstance(txt, dict) and isinstance(txt.get("div"), str):
@@ -456,6 +496,11 @@ def _sanitize_fhir_bundle(
                     if isinstance(ident, dict) and "value" in ident:
                         stats.add("MRN")
                         ident["value"] = psn if psn else "[MRN]"
+        elif rtype == "Organization":
+            if not plan.keep_district and isinstance(res.get("address"), list):
+                for a in res["address"]:
+                    if isinstance(a, dict):
+                        a.pop("city", None)
     return cleaned
 
 
@@ -480,14 +525,22 @@ def render_sanitized_file(
         # Rename only headers that embed PII (e.g. ward_vitals_sheet.csv)
         out_header = []
         id_col_idx = None
+        fallback_id_col_idx = None
         for idx, prof in enumerate(profiles):
-            if prof.role == ROLE_MRN and id_col_idx is None:
-                id_col_idx = idx
+            if prof.role == ROLE_MRN:
+                low_h = re.sub(r"[^a-z0-9]+", "_", prof.raw_name.lower()).strip("_")
+                if low_h in _RECORD_ID_KEYS or "uhid" in low_h or "mrn" in low_h or "patient" in low_h:
+                    if id_col_idx is None:
+                        id_col_idx = idx
+                elif fallback_id_col_idx is None:
+                    fallback_id_col_idx = idx
             if prof.header_has_pii:
                 stats.add("PATIENT_NAME")
                 out_header.append(f"col_{idx + 1}")
             else:
                 out_header.append(prof.raw_name)
+        if id_col_idx is None:
+            id_col_idx = fallback_id_col_idx
         if header or body:
             writer.writerow(out_header)
 

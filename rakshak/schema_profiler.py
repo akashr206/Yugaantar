@@ -1,4 +1,4 @@
-"""Dynamic schema, header, JSON-key, date-order, and hidden-channel profiler. [Person 1]"""
+"""Dynamic schema, header, JSON-key, date-order, and hidden-channel profiler."""
 from __future__ import annotations
 
 import base64
@@ -8,6 +8,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Any
 
 from rakshak.contracts import DateMention
@@ -46,8 +47,8 @@ ROLE_TEXT_FREE = "TEXT_FREE"
 ROLE_UNKNOWN = "UNKNOWN"
 
 _HEADER_SYNONYMS: dict[str, tuple[str, ...]] = {
-    ROLE_FIRST_NAME: ("first name", "firstname", "given name", "given", "fname"),
-    ROLE_LAST_NAME: ("last name", "lastname", "surname", "family name", "family", "lname"),
+    ROLE_FIRST_NAME: ("first name", "firstname", "given name", "given", "fname", "first"),
+    ROLE_LAST_NAME: ("last name", "lastname", "surname", "family name", "family", "lname", "last", "maiden", "maiden name"),
     ROLE_PATIENT_NAME: (
         "patient name",
         "patients name",
@@ -83,12 +84,17 @@ _HEADER_SYNONYMS: dict[str, tuple[str, ...]] = {
         "reg no",
         "patientid",
         "patient id",
+        "patient no",
+        "nhs no",
         "patient ref",
         "hospital uhid",
         "ipd no",
         "bill no",
         "sample id",
         "visit id",
+        "ssn",
+        "drivers",
+        "passport",
     ),
     ROLE_DOB: ("dob", "date of birth", "birth date", "birthdate", "janm tithi", "जन्म तिथि"),
     ROLE_AGE_SEX: ("age sex", "age/sex", "age gender"),
@@ -112,6 +118,18 @@ _HEADER_SYNONYMS: dict[str, tuple[str, ...]] = {
         "collected on",
         "reported on",
         "collected",
+        "recorded date",
+        "recordeddate",
+        "authored on",
+        "authoredon",
+        "last updated",
+        "lastupdated",
+        "effective datetime",
+        "effectivedatetime",
+        "performed datetime",
+        "performeddatetime",
+        "start",
+        "end",
         "date",
         "timestamp",
     ),
@@ -196,6 +214,7 @@ class ColumnProfile:
     header_has_pii: bool = False
 
 
+@lru_cache(maxsize=8192)
 def normalize_header(name: str) -> str:
     """Normalize a column header or JSON key for semantic matching."""
     text = unicodedata.normalize("NFKC", name)
@@ -210,14 +229,42 @@ def _fuzzy_best(norm: str, candidates: tuple[str, ...]) -> float:
     for c in candidates:
         if norm == c:
             return 1.0
-        if c in norm or norm in c:
+        if c in norm:
+            if c == "city" and not (norm.startswith("city") or re.search(r"(?<!\w)city(?!\w)", norm)):
+                continue
             best = max(best, 0.88 if len(c) >= 4 else 0.70)
-        else:
+        elif norm in c:
+            # Match whole-word sub-phrases (e.g. "last" in "last name") or substantial prefixes,
+            # never accidental mid-word substrings like "end" in "attendant".
+            whole_word = len(norm) >= 4 and re.search(rf"(?<!\w){re.escape(norm)}(?!\w)", c) is not None
+            best = max(best, 0.88 if (whole_word or (len(norm) >= 4 and len(norm) / len(c) >= 0.50)) else 0.65)
+        elif len(norm) > 3 and len(c) > 3:
             best = max(best, SequenceMatcher(None, norm, c).ratio())
     return best
 
 
-def _infer_role_from_values(values: list[str]) -> str | None:
+_NON_PIN_QUANTITY_HINTS = (
+    "income",
+    "salary",
+    "expense",
+    "coverage",
+    "amount",
+    "bill",
+    "cost",
+    "price",
+    "balance",
+    "weight",
+    "height",
+    "count",
+    "total",
+    "year",
+    "fips",
+    "lat",
+    "lon",
+)
+
+
+def _infer_role_from_values(values: list[str], norm_header: str = "") -> str | None:
     """Infer column role from sample values when header text is unfamiliar."""
     non_empty = [v.strip().translate(_DEVA_DIGITS) for v in values if v and v.strip()]
     if not non_empty:
@@ -233,11 +280,12 @@ def _infer_role_from_values(values: list[str]) -> str | None:
         return ROLE_PAN
     if sum(1 for v in non_empty if re.fullmatch(r"[\w.+-]+@[\w-]+\.[\w.]+", v)) / n >= 0.6:
         return ROLE_EMAIL
-    if sum(1 for v in non_empty if re.fullmatch(r"\d{6}", v)) / n >= 0.6:
-        return ROLE_PIN
+    if not any(q in norm_header for q in _NON_PIN_QUANTITY_HINTS):
+        if sum(1 for v in non_empty if re.fullmatch(r"[1-8]\d{5}", v)) / n >= 0.6:
+            return ROLE_PIN
     if sum(1 for v in non_empty if re.fullmatch(r"\d{1,3}/[MFO]", v, re.I)) / n >= 0.6:
         return ROLE_AGE_SEX
-    if sum(1 for v in non_empty if _DATE_TOKEN_RX.fullmatch(v)) / n >= 0.6:
+    if sum(1 for v in non_empty if _DATE_TOKEN_RX.match(v)) / n >= 0.6:
         return ROLE_DATE
     if sum(1 for v in non_empty if re.match(r"^(?:S/o|D/o|W/o|C/o)\s+", v, re.I)) / n >= 0.5:
         return ROLE_RELATIVE_NAME
@@ -332,11 +380,8 @@ def header_contains_pii(header: str) -> bool:
     return False
 
 
-def classify_column(raw_name: str, sample_values: list[str], hospital_hint: str = "") -> ColumnProfile:
-    """Classify a CSV/TSV column or JSON key using header semantics + cell values."""
-    has_pii = header_contains_pii(raw_name)
-    norm = normalize_header(raw_name)
-
+@lru_cache(maxsize=8192)
+def _classify_header_norm(norm: str) -> str:
     best_role = ROLE_UNKNOWN
     best_score = 0.0
     for role, syns in _HEADER_SYNONYMS.items():
@@ -344,10 +389,17 @@ def classify_column(raw_name: str, sample_values: list[str], hospital_hint: str 
         if sc > best_score:
             best_score = sc
             best_role = role
+    return best_role if best_score >= 0.80 else ROLE_UNKNOWN
 
-    if best_score < 0.80:
-        best_role = ROLE_UNKNOWN
-        inferred = _infer_role_from_values(sample_values)
+
+def classify_column(raw_name: str, sample_values: list[str], hospital_hint: str = "") -> ColumnProfile:
+    """Classify a CSV/TSV column or JSON key using header semantics + cell values."""
+    has_pii = header_contains_pii(raw_name)
+    norm = normalize_header(raw_name)
+
+    best_role = _classify_header_norm(norm)
+    if best_role == ROLE_UNKNOWN:
+        inferred = _infer_role_from_values(sample_values, norm_header=norm)
         if inferred is not None:
             best_role = inferred
 

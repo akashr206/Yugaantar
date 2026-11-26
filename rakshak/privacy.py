@@ -1,4 +1,4 @@
-"""Quasi-identifier privacy layer (Option C: Adaptive k-Anonymity Widening). [Person 2]
+"""Quasi-identifier privacy layer (Option C: Adaptive k-Anonymity Widening).
 
 Provides:
   * Keyed HMAC-SHA256 pseudonyms (PSN-XXXXXX) and non-zero per-patient date shifts
@@ -199,10 +199,10 @@ def build_privacy_plans(
             wide_band = format_age_band(age, 20, 80) if age is not None else None
             cluster_tier[ck] = (wide_band, False, False, "suppressed")
         elif cell_k < policy.min_group_size or is_elderly:
-            # Small cell: widen to 10-year band, drop PIN prefix; if still k<3, also drop District
+            # Small cell: widen to 10-year band, drop PIN prefix; if still k<min_group_size, suppress District too
             band10 = format_age_band(age, 10, 80) if age is not None else None
             k10 = wide10_cells[(band10 or "UNK", profile_gender[ck], profile_district[ck])]
-            if k10 < max(2, policy.min_group_size // 2):
+            if k10 < policy.min_group_size:
                 wide20 = format_age_band(age, 20, 80) if age is not None else None
                 cluster_tier[ck] = (wide20, False, False, "suppressed")
             else:

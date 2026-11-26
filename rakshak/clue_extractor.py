@@ -1,4 +1,4 @@
-"""Multi-format identity clue extractor and smart DMY/MDY date parser. [Person 2]
+"""Multi-format identity clue extractor and smart DMY/MDY date parser.
 
 Extracts IdentityClues and DateMentions from RecordUnits across CSV, TSV,
 nested JSON, FHIR R4 Bundles, and Devanagari/Hinglish/English clinical notes
@@ -32,7 +32,7 @@ _MONTH_MAP = {
     "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
 }
 
-_ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
+_ISO_DATE_RE = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
 _SLASH_DATE_RE = re.compile(r"\b(\d{1,2})([/.-])(\d{1,2})\2(\d{2}|\d{4})\b")
 _TEXT_DATE_RE = re.compile(
     r"\b(\d{1,2})\s+(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"

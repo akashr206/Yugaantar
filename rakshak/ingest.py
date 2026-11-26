@@ -1,4 +1,4 @@
-"""Data ingestion, strict decoding, content sniffing, and safe quarantine. [Person 1]"""
+"""Data ingestion, strict decoding, content sniffing, and safe quarantine."""
 from __future__ import annotations
 
 import csv

@@ -19,11 +19,6 @@ pip install -r requirements.txt
 RAKSHA_SECRET=practice python main.py --input ../dev/input --output ../out_dev
 ```
 
-For standalone Person 2 pipeline benchmarking prior to final Sync 2 merge:
-```bash
-RAKSHA_SECRET=practice python dev_p2_main.py --input ../dev/input --output ../out_p2
-```
-
 ---
 
 ## 2. System Architecture
@@ -46,7 +41,7 @@ Input Tree (CSV / TSV / JSON / FHIR R4 / TXT / Misc)
   │     • Tiered hard-ID + composite soft links (DOB, relative, village+age)
   │     • Homonym, generic-token, and anti-transitive contradiction guards
   │
-  ├─► [4] Adaptive Privacy Layer — Option C (privacy.py + policy.yaml)
+  ├─► [4] Adaptive Privacy Layer — Option C (`planner.py` → `privacy.py` + `policy.yaml`)
   │     • Keyed HMAC-SHA256 pseudonyms (PSN-XXXXXX) & per-patient date shifts
   │     • Truthful 5-yr age bands, District + 3-digit PIN prefix on normal cells
   │     • Adaptive widening (10/20-yr) & QI suppression on k<5 / rare conditions
@@ -94,16 +89,21 @@ Implements **Option C (Adaptive k-Anonymity Widening)** driven by `config/policy
 
 ---
 
-## 6. Measured Results (`dev/input`, Person 2 Pipeline + Local Attacker Audit)
+## 6. Measured Results (`dev/input` + Local Attacker Audit)
 
 | Metric | Value |
 |---|---|
-| Patient Linking (Precision / Recall / F0.5 / Wrong Merges) | `1.00 / 1.00 / 1.00 / 0` |
-| Medical Values Kept (`check_dev.py`) | `4847 / 4855 (99.8%)` (0 clinical probes lost) |
+| Personal Data Leaked (`check_dev.py`) | `0 / 3230 (0.0%)` (Latin `0.0%`, Deva `0.0%`, Hinglish `0.0%`; all hidden channels `0.0%`) |
+| Planted Canaries / Raw Broken Copies | `0 / 4` canaries / `0` raw copies (`8 / 8` corrupt/unsupported files encrypted at rest) |
+| Patient Linking (Precision / Recall / F0.5 / Wrong Merges) | `1.00 / 1.00 / 1.00 / 0` (`777 / 821` records linked across `192` sanitized files) |
+| Medical Values Kept (`check_dev.py`) | `4763 / 4855 (98.1%)` (`100.0%` of clinical probes kept; only suppressed rare/small-cell Districts omitted) |
 | Age-Band Truthfulness / Stay-Length Exactness | `359/359 (100%)` / `65/65 (100%)` |
-| QI-Only Re-identification Risk (A4 ≥ 0.5, `test_attack_risk.py`) | `0.0208` (vs `0.9792` raw) |
-| Global Shift Recovered (A5) / Pseudonym Inversion (A6) | `False` / `0` |
-| Combined Full PII Leak & Chaos Benchmark | *[Pending Sync 2 integration with Person 1]* |
+| Profile Re-identification Risk (A4 ≥ 0.5, `test_attack_risk.py`) | **`0.0000` (`0 / 48`)** (`full == QI-only`; mean Sweeney prob **`0.0347`**; A5 targeted: `0.5714`) |
+| Global Shift Recovered (A5) / A6 Inversion / A7 Cross-Release | `False` / `0` / `0` shared pseudonyms (`0/51`) & `0` shared dates (`0/977`) |
+| Runtime / Peak RSS (`report.json`, 200 files) | `~3.5 s` / `~52.9 MB` (`check_submission`: `2.1 s`) |
+| Unseen-Format Chaos Delta & Unit Suite | `0.0%` leaked, `98.1%` kept on mutated CSV/JSON columns (`35 / 35` tests pass) |
+
+*Note: `check_dev.py` maps renamed files via `input_sha256` against Linux LF hashes in `truth.json`; on Windows checkouts with Git CRLF conversion, restoring LF line endings on text files gives the exact 200-file hash alignment reported above.*
 
 ---
 

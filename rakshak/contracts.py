@@ -1,8 +1,7 @@
-"""Shared data contracts between Person 1 (Ingestion/Detection/Export)
-and Person 2 (Identity Linkage/Privacy Layer/Security).
+"""Shared data contracts for the Rakshak privacy firewall pipeline.
 
-Keep RecordUnit and PrivacyPlan stable after Sync 1 so both tracks can
-develop and test independently.
+Defines typed record handoff boundaries across ingestion, identity linkage,
+privacy planning, and format-preserving sanitization.
 """
 from __future__ import annotations
 
@@ -66,7 +65,7 @@ class DateMention:
 
 @dataclass(frozen=True)
 class RecordUnit:
-    """Shared input handoff from Person 1 (ingest/schema_profiler) to Person 2.
+    """Normalized record representation produced by ingestion/profiling.
 
     unit_id uniquely identifies one scorable record as "<file_rel>::<loc>".
     """
@@ -84,7 +83,7 @@ class RecordUnit:
 
 @dataclass(frozen=True)
 class NameClue:
-    """Normalized name representation used internally by Person 2."""
+    """Normalized name representation used during identity resolution."""
 
     raw: str
     latin_tokens: tuple[str, ...]
@@ -94,7 +93,7 @@ class NameClue:
 
 @dataclass(frozen=True)
 class IdentityClues:
-    """Internal clue vector extracted by Person 2 for record linkage and privacy."""
+    """Extracted identity clue vector used for record linkage and privacy planning."""
 
     unit_id: str
     file_rel: str
@@ -123,10 +122,10 @@ class IdentityClues:
 
 @dataclass(frozen=True)
 class PrivacyPlan:
-    """Shared output handoff from Person 2 back to Person 1 (or dev_p2_main).
+    """Per-record privacy directive returned by the linkage and privacy planner.
 
-    Tells the exporter what pseudonym, date offset, and quasi-identifier
-    generalization level to apply inside each record and records.jsonl.
+    Specifies the keyed pseudonym, per-patient date shift, and quasi-identifier
+    generalization tier to apply during sanitization and export.
     """
 
     unit_id: str

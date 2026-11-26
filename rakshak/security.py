@@ -1,4 +1,4 @@
-"""Security, at-rest encryption, PII-free logging, and deterministic export assembly. [Person 2]
+"""Security, at-rest encryption, PII-free logging, and deterministic export assembly.
 
 Enforces:
   * Ephemeral AES-256-GCM encryption for quarantined or staged raw payloads at rest
@@ -94,8 +94,12 @@ def peak_rss_mb() -> float:
 
             pmc = _PMC()
             pmc.cb = ctypes.sizeof(_PMC)
-            hproc = ctypes.windll.kernel32.GetCurrentProcess()
-            if ctypes.windll.psapi.GetProcessMemoryInfo(hproc, ctypes.byref(pmc), pmc.cb):
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            hproc = k32.GetCurrentProcess()
+            get_mem = ctypes.windll.psapi.GetProcessMemoryInfo
+            get_mem.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PMC), wintypes.DWORD]
+            if get_mem(hproc, ctypes.byref(pmc), pmc.cb):
                 return round(pmc.PeakWorkingSetSize / (1024 * 1024), 1)
         except Exception:
             pass
