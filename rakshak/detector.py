@@ -76,9 +76,10 @@ _SHIELD_PATTERNS: list[re.Pattern[str]] = [
         r"Hashimoto|Raynaud|Guillain|Sjogren|Kawasaki|Down|Turner|Marfan)(?:'s|s')?[ \t]+"
         r"(?:disease|syndrome|palsy|lymphoma|phenomenon)\b"
     ),
-    # Clinical shorthands
+    # Clinical shorthands & common clinical phrases containing address-like words
     re.compile(r"(?i)\b(?:K/C/O|H/O)[ \t]+[^\n.;]+"),
     re.compile(rf"(?i)\bC/O[ \t]+(?:{_COMPLAINT_WORDS})\b[^\n.;]*"),
+    re.compile(r"(?i)\bRoad[ \t]+traffic[ \t]+accident\b"),
     # ASHA workers & hospital wards with clinical department
     re.compile(r"(?i)\bASHA[ \t]+workers?\b"),
     re.compile(r"(?i)\bWard[ \t]+\d+[ \t]*\([^)\n]+\)(?:[ \t]*/[ \t]*Bed[ \t]*\d+)?"),
@@ -227,6 +228,21 @@ _LABELED_NAME_PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
         re.compile(r"(?m)(\d{2}:\d{2}[ \t]-[ \t])([A-Z][a-zA-Z.'-]+(?:[ \t]+[A-Z][a-zA-Z.'-]+){1,3})(?=[ \t]+-)"),
         2,
     ),
+    # Prefix honorifics ("Sri Ramesh Verma", "Smt. Sunita Devi", "श्री कमलेश") excluding institutional/hospital names
+    (
+        "PATIENT_NAME",
+        re.compile(
+            r"\b(?:Shri|Sri|Smt\.?|Km\.?|Mr\.?|Mrs\.?|Ms\.?|Late)[ \t]+"
+            r"(?![^\n,.;]{0,50}\b(?:Hospital|Medical|Charitable|Multispeciality|Sadan|Clinic|Institute|Trust|College|University|Foundation)\b)"
+            r"[A-Z][a-zA-Z.'-]+(?:[ \t]+[A-Z][a-zA-Z.'-]+){0,3}"
+        ),
+        0,
+    ),
+    (
+        "PATIENT_NAME",
+        re.compile(r"(?:श्री|श्रीमती|सुश्री)[ \t]+([^\s,;|()।\n]+(?:[ \t]+[^\s,;|()।\n]+){0,2})"),
+        0,
+    ),
     # Hinglish honorific phrases ("Shahid sahab", "Asha ji", "Reena behenji", "Ashok bhai", "Shahid babu", "Zainab amma")
     (
         "PATIENT_NAME",
@@ -262,6 +278,15 @@ _ADDRESS_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("VILLAGE", re.compile(r"(?m)ग्राम[: \t]+[^,\n-]+?(?=,|[ \t]+(?:तहसील|जिला)|$)")),
     ("TEHSIL", re.compile(r"(?im)\bTehsil[: \t]+[^,\n-]+?(?=,|[ \t]+(?:Distt|PIN)|$)")),
     ("TEHSIL", re.compile(r"(?m)तहसील[: \t]+[^,\n-]+?(?=,|[ \t]+जिला|$)")),
+    # Street / lane / road / marg / gali / sector addresses (case-sensitive capitalized words, guarding clinical/hospital terms)
+    (
+        "LOCALITY",
+        re.compile(
+            r"(?m)\b(?:(?i:Lane|Street|St\.?|Sector|Phase|Block|Gali)[ \t]+[A-Za-z0-9][A-Za-z0-9 .'-]{1,30}|"
+            r"(?!(?:Hospital|Medical|Clinic|College|Sanjeevani|Arogya|Jeevan|District)\b)"
+            r"[A-Z][A-Za-z0-9.'-]*(?:[ \t]+[A-Z][A-Za-z0-9.'-]*){0,2}[ \t]+(?:Road|Rd\.?|Marg|Lane|Street|St\.?|Gali|Chowk|Nagar|Vihar|Enclave|Colony))\b"
+        ),
+    ),
 ]
 
 _PIN_IN_ADDRESS_RX = re.compile(r"(?:-\s|PIN[:\s]\s*|Distt\.\s[A-Za-z\s]{3,25})(\b[1-8]\d{5}\b)")
@@ -491,15 +516,24 @@ def generalize_ages_in_text(text: str, plan: PrivacyPlan) -> str:
 
     def _rep_en(m: re.Match[str]) -> str:
         age_val = int(m.group(2).translate(_DEVA_DIGITS))
-        return f"{m.group(1)}{_band_for(age_val)}{m.group(3)}"
+        sfx = m.group(3)
+        if not getattr(plan, "keep_gender", True):
+            sfx = re.sub(r"/[MFO]$", "/[GENDER]", sfx, flags=re.I)
+        return f"{m.group(1)}{_band_for(age_val)}{sfx}"
 
     def _rep_wa(m: re.Match[str]) -> str:
         age_val = int(m.group(2).translate(_DEVA_DIGITS))
-        return f"{m.group(1)}{_band_for(age_val)}{m.group(3)}"
+        sfx = m.group(3)
+        if not getattr(plan, "keep_gender", True):
+            sfx = re.sub(r"/\s*[MFO]$", "/[GENDER]", sfx, flags=re.I)
+        return f"{m.group(1)}{_band_for(age_val)}{sfx}"
 
     def _rep_hi(m: re.Match[str]) -> str:
         age_val = int(m.group(2).translate(_DEVA_DIGITS))
-        return f"{m.group(1)}{_band_for(age_val)}{m.group(3)}"
+        sfx = m.group(3)
+        if not getattr(plan, "keep_gender", True):
+            sfx = re.sub(r"\s*/\s*(?:पुरुष|महिला|अन्य)$", " / [GENDER]", sfx)
+        return f"{m.group(1)}{_band_for(age_val)}{sfx}"
 
     out = _FREE_AGE_EN_RX.sub(_rep_en, text)
     out = _FREE_AGE_WA_RX.sub(_rep_wa, out)
@@ -629,9 +663,13 @@ def sanitize_structured_cell(
             age_v = int(m.group(1))
             band = (plan.age_band if (plan and plan.age_band) else ("[AGE]" if is_suppressed else format_age_band(age_v)))
             stats.generalized += 1
-            return f"{band}/{m.group(2).upper()}"
+            g_str = "[GENDER]" if (plan is not None and not getattr(plan, "keep_gender", True)) else m.group(2).upper()
+            return f"{band}/{g_str}"
         return clean_free_text(value, stats, plan=plan, hospital_hint=hospital_hint)
     if role == ROLE_GENDER:
+        if plan is not None and not getattr(plan, "keep_gender", True):
+            stats.generalized += 1
+            return "[GENDER]"
         return value
     if role == ROLE_METADATA:
         # Redact source_path / clerk usernames carrying patient identifiers

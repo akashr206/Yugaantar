@@ -479,6 +479,8 @@ def _sanitize_fhir_bundle(
                 or not re.fullmatch(r"\d{4}(?:-\d{2}(?:-\d{2})?)?", str(res["birthDate"]))
             ):
                 res.pop("birthDate", None)
+            if not getattr(plan, "keep_gender", True):
+                res["gender"] = "unknown"
             # Sanitize narrative div cleanly
             txt = res.get("text")
             if isinstance(txt, dict) and isinstance(txt.get("div"), str):
@@ -526,6 +528,7 @@ def _sanitize_fhir_bundle(
                 for a in res["address"]:
                     if isinstance(a, dict):
                         a.pop("city", None)
+                        a.pop("district", None)
     return cleaned
 
 

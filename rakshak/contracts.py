@@ -136,3 +136,4 @@ class PrivacyPlan:
     keep_district: bool = True
     keep_pin_prefix: bool = True
     generalization_level: str = "standard"  # "standard" | "widened" | "suppressed"
+    keep_gender: bool = True

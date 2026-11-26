@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import os
 import re
+import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -232,9 +233,15 @@ def main() -> int:
     ap.add_argument("--output", required=True)
     args = ap.parse_args()
 
+    inp_path = _unquote_cli_path(args.input)
+    out_path = _unquote_cli_path(args.output)
+    if not inp_path.is_dir():
+        sys.stderr.write("error: input directory does not exist\n")
+        return 2
+
     policy = PolicyConfig.from_yaml(HERE / "config" / "policy.yaml")
     secret = os.environ.get("RAKSHA_SECRET", "").encode("utf-8")
-    report = run_pipeline(_unquote_cli_path(args.input), _unquote_cli_path(args.output), policy, secret)
+    report = run_pipeline(inp_path, out_path, policy, secret)
     log_summary(report)
     return 0
 

@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 import unittest
+from unittest.mock import patch
 
-from rakshak.contracts import IdentityClues, PolicyConfig
+from rakshak.contracts import DateMention, IdentityClues, PolicyConfig
+from rakshak.detector import DetectionStats, clean_free_text, sanitize_structured_cell
+from rakshak.formats import _sanitize_fhir_bundle, _sanitize_json_scalar
 from rakshak.privacy import (
+    _hull_age_band,
     apply_privacy_to_text,
     build_privacy_plans,
     format_age_band,
@@ -14,6 +19,7 @@ from rakshak.privacy import (
     make_pseudonym,
     shift_date_token,
 )
+from rakshak.schema_profiler import ROLE_AGE, ROLE_AGE_SEX, ROLE_DISTRICT, ROLE_GENDER
 
 
 class TestPhase4Privacy(unittest.TestCase):
@@ -71,11 +77,13 @@ class TestPhase4Privacy(unittest.TestCase):
         self.assertEqual(plans["f0::doc"].age_band, "45-49")
         self.assertTrue(plans["f0::doc"].keep_district)
         self.assertTrue(plans["f0::doc"].keep_pin_prefix)
+        self.assertTrue(plans["f0::doc"].keep_gender)
 
         self.assertEqual(plans[rare_uid].generalization_level, "suppressed")
-        self.assertEqual(plans[rare_uid].age_band, "80+")
+        self.assertEqual(plans[rare_uid].age_band, "[AGE]")
         self.assertFalse(plans[rare_uid].keep_district)
         self.assertFalse(plans[rare_uid].keep_pin_prefix)
+        self.assertFalse(plans[rare_uid].keep_gender)
 
     def test_text_transform_preserves_doses_and_shifts_dates(self) -> None:
         policy = PolicyConfig(min_group_size=1)
@@ -99,6 +107,140 @@ class TestPhase4Privacy(unittest.TestCase):
         self.assertNotIn("13/01/2026", new_txt)
         self.assertEqual(generalize_pin("226183", True, 3), "226***")
         self.assertEqual(generalize_pin("226183", False, 3), "[PIN]")
+
+    def test_pseudonym_length_and_deterministic_collision_resolution(self) -> None:
+        pid = make_pseudonym("ID|test123", b"secret-1")
+        self.assertRegex(pid, r"^PSN-[0-9A-Z]{10}$")
+
+        policy = PolicyConfig(min_group_size=1)
+        c1 = IdentityClues("a::doc", "a", "doc", age=30, gender="M")
+        c2 = IdentityClues("b::doc", "b", "doc", age=40, gender="F")
+        cmap_1 = {"a::doc": "ID|alpha", "b::doc": "ID|beta"}
+
+        def fake_make_pseudonym(cluster_key: str, secret: bytes) -> str:
+            # Force a deterministic collision between initial alpha and beta
+            if cluster_key in ("ID|alpha", "ID|beta"):
+                return "PSN-COLLIDE001"
+            return "PSN-RESOLVED02"
+
+        with patch("rakshak.privacy.make_pseudonym", side_effect=fake_make_pseudonym):
+            plans_1 = build_privacy_plans([c1, c2], cmap_1, policy, b"sec")
+            plans_2 = build_privacy_plans([c2, c1], cmap_1, policy, b"sec")  # reversed input order
+            plans_3 = build_privacy_plans([c1, c2], cmap_1, policy, b"sec")  # repeat run
+
+        self.assertNotEqual(plans_1["a::doc"].pseudonym, plans_1["b::doc"].pseudonym)
+        self.assertEqual(plans_1["a::doc"].pseudonym, plans_2["a::doc"].pseudonym)
+        self.assertEqual(plans_1["b::doc"].pseudonym, plans_2["b::doc"].pseudonym)
+        self.assertEqual(plans_1["b::doc"].pseudonym, plans_3["b::doc"].pseudonym)
+
+    def test_c1_hull_age_band_and_pin_dob_subgroup_widening(self) -> None:
+        # Cross-visit ages spanning band boundaries stay truthful with width <= 30
+        hull = _hull_age_band([39, 41], 5, 85)
+        lo, hi = (int(x) for x in hull.split("-"))
+        self.assertLessEqual(lo, 39)
+        self.assertGreaterEqual(hi, 41)
+        self.assertLessEqual(hi - lo, 30)
+        self.assertEqual(_hull_age_band([78, 81], 20, 80), "70+")
+
+        # Within a k=5 standard cell, a unique PIN prefix / birth year is widened instead of keeping PIN/DOB
+        policy = PolicyConfig(age_band_years=5, min_group_size=5, rare_condition_threshold=1, adaptive_widening=True)
+        clues = []
+        cmap = {}
+        for i in range(5):
+            uid = f"u{i}::doc"
+            clues.append(
+                IdentityClues(
+                    uid,
+                    "u",
+                    "doc",
+                    age=47,
+                    gender="M",
+                    district_norm="lckn",
+                    pin="227999" if i == 0 else "226001",
+                    dob=f"{1978 + (i % 2)}-05-10" if i > 0 else "1979-11-20",
+                    conditions=("E11.9",),
+                )
+            )
+            cmap[uid] = f"ID|p{i}"
+        plans = build_privacy_plans(clues, cmap, policy, b"sec")
+        self.assertFalse(plans["u0::doc"].keep_pin_prefix)
+        self.assertEqual(plans["u0::doc"].generalization_level, "widened")
+        self.assertTrue(plans["u0::doc"].keep_gender)
+
+    def test_c1_age_and_gender_suppression_across_formats(self) -> None:
+        policy = PolicyConfig(age_band_years=5, min_group_size=5, rare_condition_threshold=2, adaptive_widening=True)
+        rare = IdentityClues(
+            "rare::doc",
+            "r",
+            "doc",
+            age=68,
+            gender="F",
+            district_norm="lckn",
+            conditions=("A82.9",),
+            dates=(
+                DateMention("01/03/2026", "2026-03-01", role="admission"),
+                DateMention("06/03/2026", "2026-03-06", role="discharge"),
+            ),
+        )
+        plan = build_privacy_plans([rare], {"rare::doc": "ID|rare_pt"}, policy, b"sec")["rare::doc"]
+        self.assertEqual(plan.age_band, "[AGE]")
+        self.assertFalse(plan.keep_gender)
+        self.assertEqual(plan.generalization_level, "suppressed")
+
+        stats = DetectionStats()
+        # CSV/TSV structured cell paths
+        self.assertEqual(sanitize_structured_cell("68", ROLE_AGE, "dmy", plan, stats), "[AGE]")
+        self.assertEqual(sanitize_structured_cell("F", ROLE_GENDER, "dmy", plan, stats), "[GENDER]")
+        self.assertEqual(sanitize_structured_cell("68/F", ROLE_AGE_SEX, "dmy", plan, stats), "[AGE]/[GENDER]")
+        self.assertEqual(sanitize_structured_cell("Lucknow", ROLE_DISTRICT, "dmy", plan, stats), "[DISTRICT]")
+
+        # Free-text paths (English, WhatsApp, Hindi) preserve clinical text
+        txt = (
+            "Age/Sex: 68 Yrs/F\n"
+            "आयु: 68 वर्ष / महिला\n"
+            "Diagnosis: Rabies, unspecified (A82.9)\n"
+            "Inj Human Rabies Immunoglobulin 20 IU/kg"
+        )
+        cleaned = clean_free_text(txt, stats, plan=plan)
+        self.assertIn("Age/Sex: [AGE] Yrs/[GENDER]", cleaned)
+        self.assertIn("आयु: [AGE] वर्ष / [GENDER]", cleaned)
+        self.assertIn("Rabies, unspecified (A82.9)", cleaned)
+        self.assertIn("20 IU/kg", cleaned)
+
+        # JSON integer scalar
+        self.assertEqual(_sanitize_json_scalar("age", 68, plan, stats, "", False), "[AGE]")
+
+        # FHIR R4 Bundle: Patient.gender="unknown", no birthDate, stripped Organization.district
+        bundle = {
+            "resourceType": "Bundle",
+            "type": "document",
+            "entry": [
+                {
+                    "resource": {
+                        "resourceType": "Patient",
+                        "gender": "female",
+                        "birthDate": "1958-04-12",
+                        "text": {"status": "generated", "div": "<div>X</div>"},
+                    }
+                },
+                {
+                    "resource": {
+                        "resourceType": "Organization",
+                        "name": "Jeevan Jyoti Charitable Hospital",
+                        "address": [{"city": "Hardoi", "district": "Hardoi"}],
+                    }
+                },
+            ],
+        }
+        san_b = _sanitize_fhir_bundle(bundle, plan, stats, "jjh")
+        pt_res = san_b["entry"][0]["resource"]
+        org_res = san_b["entry"][1]["resource"]
+        self.assertEqual(pt_res["gender"], "unknown")
+        self.assertNotIn("birthDate", pt_res)
+        self.assertIn("[AGE], unknown", pt_res["text"]["div"])
+        self.assertEqual(org_res["name"], "Jeevan Jyoti Charitable Hospital")
+        self.assertNotIn("district", org_res["address"][0])
+        self.assertNotIn("city", org_res["address"][0])
 
 
 if __name__ == "__main__":

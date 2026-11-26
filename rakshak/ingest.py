@@ -470,6 +470,44 @@ def sanitize_rel_path(
     return "/".join(new_parts), any_renamed
 
 
+def _validate_csv_syntax(text: str, delim: str) -> bool:
+    """Validate RFC 4180 quote state while preserving multiline cells and ragged legacy rows."""
+    in_quotes = False
+    at_field_start = True
+    just_closed_quote = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_quotes:
+            if ch == '"':
+                if i + 1 < n and text[i + 1] == '"':
+                    i += 2
+                    continue
+                in_quotes = False
+                just_closed_quote = True
+            i += 1
+            continue
+        if just_closed_quote:
+            if ch == delim or ch in ("\n", "\r"):
+                just_closed_quote = False
+                at_field_start = True
+                i += 1
+                continue
+            return False
+        if ch == '"':
+            if not at_field_start:
+                return False
+            in_quotes = True
+            at_field_start = False
+        elif ch == delim or ch in ("\n", "\r"):
+            at_field_start = True
+        else:
+            at_field_start = False
+        i += 1
+    return not in_quotes
+
+
 def ingest_file(path: Path, inp_root: Path, secret: bytes) -> IngestResult:
     """Read, validate, sniff, and decode a single input file or raise QuarantineError."""
     rel = path.relative_to(inp_root).as_posix()
@@ -498,8 +536,10 @@ def ingest_file(path: Path, inp_root: Path, secret: bytes) -> IngestResult:
                 if stripped.startswith("{"):
                     raise QuarantineError("format_mismatch")
         delim = "\t" if ext == ".tsv" else ","
+        if not _validate_csv_syntax(text, delim):
+            raise QuarantineError("csv_error")
         try:
-            rows = list(csv.reader(io.StringIO(text, newline=""), delimiter=delim))
+            rows = list(csv.reader(io.StringIO(text, newline=""), delimiter=delim, strict=True))
         except csv.Error as exc:
             raise QuarantineError("csv_error") from exc
         if not rows or all(not any(c.strip() for c in r) for r in rows):

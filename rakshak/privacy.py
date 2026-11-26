@@ -57,10 +57,10 @@ _TXT_WA_HEADER_RE = re.compile(r"^(\[)(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})(,[^\]]*\])
 
 
 def make_pseudonym(cluster_key: str, secret: bytes) -> str:
-    """Stable, non-reversible HMAC-SHA256 pseudonym keyed by RAKSHA_SECRET."""
+    """Stable, non-reversible 50-bit HMAC-SHA256 pseudonym keyed by RAKSHA_SECRET."""
     digest = hmac.new(secret, cluster_key.encode("utf-8"), hashlib.sha256).digest()
-    n = int.from_bytes(digest[:5], "big")
-    code = "".join(_ALPHABET[(n >> (5 * i)) & 31] for i in range(6))
+    n = int.from_bytes(digest[:7], "big")
+    code = "".join(_ALPHABET[(n >> (5 * i)) & 31] for i in range(10))
     return f"PSN-{code}"
 
 
@@ -128,6 +128,34 @@ def shift_date_token(raw_date: str, shift_days: int, order: str = "dmy") -> str:
     return raw_date
 
 
+def _hull_age_band(ages: list[int], width: int, cap: int) -> str:
+    """Return a single truthful band covering [min(ages), max(ages)] with width <= 30."""
+    lo_a = max(0, min(ages))
+    hi_a = min(120, max(ages))
+    if lo_a >= cap:
+        return f"{cap}+"
+    if hi_a >= cap and lo_a >= 50:
+        step = (lo_a // 10) * 10
+        return f"{max(50, step)}+"
+    b_lo = format_age_band(lo_a, width, cap)
+    b_hi = format_age_band(hi_a, width, cap)
+    if b_lo == b_hi:
+        return b_lo
+    span = hi_a - lo_a
+    for w in (10, 20, 30):
+        lo_w = (lo_a // w) * w
+        hi_w = lo_w + w - 1
+        if lo_w <= lo_a and hi_a <= hi_w and (hi_w - lo_w) <= 30:
+            return f"{lo_w}-{min(120, hi_w)}"
+    lo_c = (lo_a // 5) * 5
+    hi_c = max(hi_a, lo_c + max(width - 1, span))
+    if hi_c - lo_c <= 30:
+        return f"{lo_c}-{min(120, hi_c)}"
+    if lo_a >= 50:
+        return f"{(lo_a // 10) * 10}+"
+    return "[AGE]"
+
+
 def build_privacy_plans(
     clues: list[IdentityClues],
     cluster_map: dict[str, str | None],
@@ -178,10 +206,54 @@ def build_privacy_plans(
         band10 = format_age_band(age, 10, 80) if age is not None else "UNK"
         wide10_cells[(band10, profile_gender[ck], profile_district[ck])] += 1
 
-    # Decide per-cluster generalization tier under Option C
-    cluster_tier: dict[str, tuple[str | None, bool, bool, str]] = {}
+    # Extract cluster-level PIN prefix, birth year, and stay lengths for subgroup & cohort k-checks
+    profile_pin_px: dict[str, str] = {}
+    profile_birth_yr: dict[str, str] = {}
+    profile_stays: dict[str, set[int]] = {}
+    for ck, members in sorted(cluster_units.items()):
+        pins = [
+            m.pin[: policy.pin_prefix_digits]
+            for m in members
+            if m.pin and len(m.pin) >= policy.pin_prefix_digits
+        ]
+        profile_pin_px[ck] = pins[0] if pins else "U"
+        dobs = [m.dob[:4] for m in members if m.dob and len(m.dob) >= 4]
+        profile_birth_yr[ck] = dobs[0] if dobs else "U"
+        stays_ck: set[int] = set()
+        adm_ds: list[dt.date] = []
+        dis_ds: list[dt.date] = []
+        for m in members:
+            for dm in m.dates:
+                if not dm.iso_date:
+                    continue
+                try:
+                    d_obj = dt.date.fromisoformat(dm.iso_date)
+                except ValueError:
+                    continue
+                if dm.role == "admission":
+                    adm_ds.append(d_obj)
+                elif dm.role == "discharge":
+                    dis_ds.append(d_obj)
+        for a_d in adm_ds:
+            for b_d in dis_ds:
+                if 0 <= (b_d - a_d).days <= 90:
+                    stays_ck.add((b_d - a_d).days)
+        profile_stays[ck] = stays_ck
+
+    pin_cells: Counter[tuple[str, str, str, str]] = Counter(
+        (profile_std_band[ck] or "UNK", profile_gender[ck], profile_district[ck], profile_pin_px[ck])
+        for ck in cluster_units
+    )
+    byr_cells: Counter[tuple[str, str, str, str]] = Counter(
+        (profile_std_band[ck] or "UNK", profile_gender[ck], profile_district[ck], profile_birth_yr[ck])
+        for ck in cluster_units
+    )
+
+    # Decide per-cluster generalization tier under C1 (subgroup k-anonymity + cohort-aware QI suppression)
+    cluster_tier: dict[str, tuple[str | None, bool, bool, str, bool]] = {}
     for ck in sorted(cluster_units):
         age = profile_age[ck]
+        ages_all = [m.age for m in cluster_units[ck] if m.age is not None]
         std_band = profile_std_band[ck]
         has_rare = any(
             cond_patient_counts[cond] <= policy.rare_condition_threshold
@@ -191,43 +263,93 @@ def build_privacy_plans(
         is_elderly = age is not None and age >= policy.max_age_cap
 
         if not policy.adaptive_widening:
-            cluster_tier[ck] = (std_band, True, True, "standard")
+            hull_b = _hull_age_band(ages_all, policy.age_band_years, policy.max_age_cap) if ages_all else std_band
+            cluster_tier[ck] = (hull_b, True, True, "standard", True)
             continue
 
+        # Evaluate condition and stay cohort sizes within (20-yr band, gender) to guard targeted outliers
+        band20_ck = format_age_band(age, 20, 80) if age is not None else "UNK"
+        cond_cohort = min(
+            (
+                sum(
+                    1
+                    for ock in cluster_units
+                    if (format_age_band(profile_age[ock], 20, 80) if profile_age[ock] is not None else "UNK") == band20_ck
+                    and profile_gender[ock] == profile_gender[ck]
+                    and cond in profile_conds[ock]
+                )
+                for cond in profile_conds[ck]
+            ),
+            default=99,
+        )
+        stay_cohort = min(
+            (
+                sum(
+                    1
+                    for ock in cluster_units
+                    if (format_age_band(profile_age[ock], 20, 80) if profile_age[ock] is not None else "UNK") == band20_ck
+                    and profile_gender[ock] == profile_gender[ck]
+                    and st in profile_stays[ock]
+                )
+                for st in profile_stays[ck]
+            ),
+            default=99,
+        )
+        vuln_targeted = (
+            has_rare
+            or (cond_cohort <= 2)
+            or (stay_cohort <= 2)
+            or (cell_k < policy.min_group_size and is_elderly)
+        )
+
         if has_rare or (cell_k < policy.min_group_size and is_elderly):
-            # High-risk outlier: 20-year age band (or 80+), suppress PIN prefix and District
-            wide_band = format_age_band(age, 20, 80) if age is not None else None
-            cluster_tier[ck] = (wide_band, False, False, "suppressed")
+            wide_b = "[AGE]" if vuln_targeted else (_hull_age_band(ages_all, 20, 80) if ages_all else None)
+            cluster_tier[ck] = (wide_b, False, False, "suppressed", not vuln_targeted)
         elif cell_k < policy.min_group_size or is_elderly:
-            # Small cell: widen to 10-year band, drop PIN prefix; if still k<min_group_size, suppress District too
             band10 = format_age_band(age, 10, 80) if age is not None else None
             k10 = wide10_cells[(band10 or "UNK", profile_gender[ck], profile_district[ck])]
             if k10 < policy.min_group_size:
-                wide20 = format_age_band(age, 20, 80) if age is not None else None
-                cluster_tier[ck] = (wide20, False, False, "suppressed")
+                wide_b = "[AGE]" if vuln_targeted else (_hull_age_band(ages_all, 20, 80) if ages_all else None)
+                cluster_tier[ck] = (wide_b, False, False, "suppressed", not vuln_targeted)
             else:
-                cluster_tier[ck] = (band10, True, False, "widened")
+                hull10 = _hull_age_band(ages_all, 10, 80) if ages_all else band10
+                cluster_tier[ck] = (hull10, True, False, "widened", True)
         else:
-            cluster_tier[ck] = (std_band, True, True, "standard")
+            pin_ok = (profile_pin_px[ck] == "U") or (
+                pin_cells[(std_band or "UNK", profile_gender[ck], profile_district[ck], profile_pin_px[ck])]
+                >= policy.min_group_size
+            )
+            byr_ok = (profile_birth_yr[ck] == "U") or (
+                byr_cells[(std_band or "UNK", profile_gender[ck], profile_district[ck], profile_birth_yr[ck])]
+                >= policy.min_group_size
+            )
+            lvl = "standard" if byr_ok else "widened"
+            hull_s = _hull_age_band(ages_all, policy.age_band_years, policy.max_age_cap) if ages_all else std_band
+            cluster_tier[ck] = (hull_s, True, pin_ok, lvl, True)
+
+    # Assign collision-free pseudonyms & shifts deterministically in sorted cluster order
+    cluster_pid: dict[str, str] = {}
+    used_pids: set[str] = set()
+    for ck in sorted(cluster_units):
+        pid = make_pseudonym(ck, secret)
+        attempt = 1
+        while pid in used_pids:
+            pid = make_pseudonym(f"{ck}#c{attempt}", secret)
+            attempt += 1
+        used_pids.add(pid)
+        cluster_pid[ck] = pid
 
     # Assemble per-unit PrivacyPlan
     plans: dict[str, PrivacyPlan] = {}
     for c in clues:
         ck = cluster_map.get(c.unit_id)
         if ck:
-            pid = make_pseudonym(ck, secret)
+            pid = cluster_pid[ck]
             shift = make_date_shift_days(ck, secret, policy.date_shift_max_days)
-            p_band, keep_dist, keep_pin, level = cluster_tier[ck]
-            # Use unit-specific age band when unit has its own age (e.g. 2024 vs 2026 visit)
-            if c.age is not None:
-                if level == "standard":
-                    unit_band: str | None = format_age_band(c.age, policy.age_band_years, policy.max_age_cap)
-                elif level == "widened":
-                    unit_band = format_age_band(c.age, 10, 80)
-                else:
-                    unit_band = format_age_band(c.age, 20, 80)
-            else:
-                unit_band = p_band
+            p_band, keep_dist, keep_pin, level, keep_gen = cluster_tier[ck]
+            unit_band = p_band
+            if unit_band is None and c.age is not None:
+                unit_band = format_age_band(c.age, 20 if level == "suppressed" else 10, 80)
             plans[c.unit_id] = PrivacyPlan(
                 unit_id=c.unit_id,
                 cluster_key=ck,
@@ -237,6 +359,7 @@ def build_privacy_plans(
                 keep_district=keep_dist,
                 keep_pin_prefix=keep_pin,
                 generalization_level=level,
+                keep_gender=keep_gen,
             )
         else:
             # Unlinked or non-patient unit: deterministic per-unit date shift, standard 5-yr age band if age present
@@ -430,7 +553,9 @@ def apply_privacy_to_fhir_bundle(
         rtype = res.get("resourceType")
         if rtype == "Patient":
             if res.get("birthDate"):
-                if plan.generalization_level != "standard":
+                if plan.generalization_level == "suppressed":
+                    res.pop("birthDate", None)
+                elif plan.generalization_level != "standard":
                     # Year-only or shifted year on high-risk profiles (keep valid FHIR date syntax: YYYY)
                     iso = parse_date_string(str(res["birthDate"]), "iso")
                     res["birthDate"] = iso[:4] if iso else "1900"

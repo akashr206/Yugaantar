@@ -67,6 +67,10 @@ _NAME_ANCHOR_RE = re.compile(
 _HINGLISH_HON_RE = re.compile(
     r"\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)\s+(?:ji|sahab|saheb|babu|amma|didi|behenji|bahanji|bhai)\b"
 )
+_NURSING_TIME_NAME_RE = re.compile(
+    r"(?:^|\b)\d{2}:\d{2}[ \t]*-[ \t]*([A-Z][a-zA-Z.'-]+(?:[ \t]+[A-Z][a-zA-Z.'-]+){0,3})[ \t]*-"
+)
+_NURSING_NON_NAMES = frozenset({"patient", "dr", "ward", "vitals", "note", "next", "morning", "evening"})
 _KINSHIP_OPEN_RE = re.compile(
     r"(?m)^([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)\s*,\s*(?:S/[oO]|D/[oO]|W/[oO])\s+([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)"
 )
@@ -800,6 +804,13 @@ def _extract_free_text_clues(
             cand = m.group(1)
             # Exclude common non-name capitalized phrases like "Dr"
             if cand.lower() not in ("dr", "patient", "review"):
+                nc = _make_name_clue(cand, "patient")
+                if nc:
+                    p_names.append(nc)
+        for m in _NURSING_TIME_NAME_RE.finditer(line):
+            cand = m.group(1).strip()
+            first_tok = cand.split()[0].rstrip(".").lower() if cand else ""
+            if cand and first_tok not in _NURSING_NON_NAMES:
                 nc = _make_name_clue(cand, "patient")
                 if nc:
                     p_names.append(nc)

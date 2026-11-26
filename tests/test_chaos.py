@@ -129,6 +129,43 @@ class TestIngestionAndTraps(unittest.TestCase):
         self.assertIn("245 mg/dL", cleaned)
         self.assertIn("70-140", cleaned)
 
+    def test_street_names_and_prefix_honorifics_with_negative_guards(self) -> None:
+        sample = (
+            "Patient: Sri Ramesh Verma\n"
+            "Wife: Smt. Sunita Devi, श्री कमलेश कुमार\n"
+            "Address: H.No. 12, Lane MG Road, Sector 14, Distt. Kanpur\n"
+            "Facility: Sanjeevani Multispeciality Hospital, Sri Venkateswara Hospital\n"
+            "Doctor: Dr. Ramesh Srivastava reviewed Road traffic accident history.\n"
+        )
+        stats = DetectionStats()
+        cleaned = clean_free_text(sample, stats)
+        self.assertNotIn("Ramesh Verma", cleaned)
+        self.assertNotIn("Sunita Devi", cleaned)
+        self.assertNotIn("कमलेश", cleaned)
+        self.assertNotIn("MG Road", cleaned)
+        self.assertNotIn("Sector 14", cleaned)
+        # Negative guards: clinical terms, doctors, and hospitals survive
+        self.assertIn("Dr. Ramesh Srivastava", cleaned)
+        self.assertIn("Sanjeevani Multispeciality Hospital", cleaned)
+        self.assertIn("Sri Venkateswara Hospital", cleaned)
+        self.assertIn("Road traffic accident", cleaned)
+
+    def test_strict_csv_quarantines_malformed_quotes_but_keeps_multiline_and_ragged(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            inp = Path(td)
+            (inp / "bad_unterminated.csv").write_text('a,b\n"unterminated,123\n', encoding="utf-8")
+            (inp / "bad_stray_quote.csv").write_text('a,b\nfoo"bar,123\n', encoding="utf-8")
+            (inp / "valid_multiline_ragged.csv").write_text(
+                'id,name,notes\n1,Asha,"Line 1\nLine 2 ""quoted"""\n2,Ramesh\n', encoding="utf-8"
+            )
+            with self.assertRaises(QuarantineError):
+                ingest_file(inp / "bad_unterminated.csv", inp, SECRET)
+            with self.assertRaises(QuarantineError):
+                ingest_file(inp / "bad_stray_quote.csv", inp, SECRET)
+            ok_res = ingest_file(inp / "valid_multiline_ragged.csv", inp, SECRET)
+            self.assertEqual(ok_res.format_type, "csv")
+            self.assertEqual(len(ok_res.parsed[2]), 2)
+
 
 class TestChaosMutatedDataset(unittest.TestCase):
     def test_mutated_unseen_headers_keys_and_canaries(self) -> None:

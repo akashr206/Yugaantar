@@ -202,6 +202,40 @@ class TestFullPipelineIntegration(unittest.TestCase):
             self.assertIn("[DISTRICT]", cleaned)
             self.assertNotIn("जिला हरदोई", cleaned)
 
+    def test_missing_input_dir_exits_nonzero_and_empty_dir_succeeds(self) -> None:
+        import os
+        import subprocess
+        import sys
+
+        enma_dir = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            missing_in = tmp / "nonexistent"
+            missing_out = tmp / "out_missing"
+            env = dict(os.environ, RAKSHA_SECRET="cli-test-secret")
+            r_miss = subprocess.run(
+                [sys.executable, str(enma_dir / "main.py"), "--input", str(missing_in), "--output", str(missing_out)],
+                cwd=str(enma_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(r_miss.returncode, 0)
+            self.assertFalse((missing_out / "report.json").exists())
+
+            empty_in = tmp / "empty_in"
+            empty_in.mkdir()
+            empty_out = tmp / "out_empty"
+            r_empty = subprocess.run(
+                [sys.executable, str(enma_dir / "main.py"), "--input", str(empty_in), "--output", str(empty_out)],
+                cwd=str(enma_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(r_empty.returncode, 0)
+            self.assertTrue((empty_out / "report.json").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

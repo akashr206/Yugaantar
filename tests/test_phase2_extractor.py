@@ -104,6 +104,7 @@ class TestPhase2Extractor(unittest.TestCase):
         self.assertIn("kgmu26009912", clue.mrns)
         self.assertIn("sgpgi882210", clue.mrns)
 
+<<<<<<< Updated upstream
     def test_unseen_facility_pooled_mdy_inference_without_hardcoding(self) -> None:
         units = [
             RecordUnit(
@@ -128,6 +129,23 @@ class TestPhase2Extractor(unittest.TestCase):
         self.assertEqual(orders[("notes/mercy_02.txt", "__doc__")], "mdy")
         clues = extract_all_clues(units)
         self.assertEqual([d.iso_date for d in clues[1].dates], ["2026-02-01", "2026-02-06"])
+=======
+    def test_timestamped_nursing_note_extraction_and_non_name_guard(self) -> None:
+        u = RecordUnit(
+            unit_id="notes/n_ts.txt::doc",
+            file_rel="notes/n_ts.txt",
+            loc="doc",
+            format_type="txt",
+            raw_text=(
+                "15/07/2026 14:00 - Mohd Arif - K/C/O DM2. Attendant (S/o Abdul Karim) informed.\n"
+                "18:00 - Patient - vitals stable.\n"
+                "19:00 - Dr. Ramesh - evening round.\n"
+            ),
+        )
+        clue = extract_all_clues([u])[0]
+        self.assertEqual([n.latin_tokens for n in clue.patient_names], [("mohammad", "arif")])
+        self.assertEqual([r.latin_tokens for r in clue.relative_names], [("abdul", "karim")])
+>>>>>>> Stashed changes
 
 
 if __name__ == "__main__":
