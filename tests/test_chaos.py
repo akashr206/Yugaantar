@@ -1,4 +1,4 @@
-"""Unseen-format ("Chaos") and meaning-trap test suite. [Person 1]"""
+"""Unseen-format ("Chaos") and meaning-trap test suite."""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,9 @@ from rakshak.contracts import PolicyConfig
 from rakshak.detector import DetectionStats, clean_free_text
 from rakshak.ingest import QuarantineError, ingest_file, sanitize_rel_path
 
-KIT_ROOT = Path(__file__).resolve().parents[2] / "Secret-Wards-ToolKit"
+_REPO_PARENT = Path(__file__).resolve().parents[2]
+_DIRECT_DEV_INPUT = _REPO_PARENT / "dev" / "input"
+KIT_ROOT = _REPO_PARENT if _DIRECT_DEV_INPUT.is_dir() else _REPO_PARENT / "Secret-Wards-ToolKit"
 DEV_INPUT = KIT_ROOT / "dev" / "input"
 SECRET = b"chaos-test-secret-key"
 

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Local adversarial privacy risk simulator modeled on docs/ATTACKS.md. [Person 2]
+"""Local adversarial privacy risk simulator modeled on docs/ATTACKS.md.
 
 Evaluates exported sanitized/ + records.jsonl against dev/attacker/registry.csv
 and dev/attacker/known_facts.jsonl (A2/A3 record linkage, A4 profile aggregation,
 A5 targeted known-fact + global-shift recovery, A6 pseudonym inversion), plus
 100% age-band truthfulness and stay-length interval checks against truth.json.
 
-Also reports "QI-only" risk (masking direct PII names/phones/IDs) so Person 2 can
-measure Option C's quasi-identifier resistance independently of Person 1's NER.
+Also reports "QI-only" risk (masking direct PII names/phones/IDs) to measure
+Option C's quasi-identifier resistance independently of NER/redaction.
 """
 from __future__ import annotations
 
@@ -184,7 +184,7 @@ def _extract_profile_evidence(
             iso = parse_date_string(sv, date_orders.get((file_rel, k), "dmy"))
             if iso:
                 prof.birth_years.add(int(iso[:4]))
-        elif any(x in kl for x in ("date", "admission", "discharge", "collected", "registered")):
+        elif kl in ("start", "end") or any(x in kl for x in ("date", "admission", "discharge", "collected", "registered")):
             iso = parse_date_string(sv, date_orders.get((file_rel, k), "dmy"))
             if iso:
                 prof.dates.add(iso)
@@ -398,19 +398,41 @@ def run_attack_audit(
 
     date_orders = infer_file_date_orders(units)
 
+    sha_to_out_rel: dict[str, str] = {}
+    rep_path = out_dir / "report.json"
+    if rep_path.exists():
+        rep = json.loads(rep_path.read_text(encoding="utf-8"))
+        for entry in rep.get("files") or []:
+            if entry.get("status") == "sanitized" and entry.get("input_sha256") and entry.get("output"):
+                sha_to_out_rel[str(entry["input_sha256"])] = str(entry["output"]).replace("sanitized/", "", 1)
+    input_root = truth_path.resolve().parents[1] / "input"
+    parsed_rels = {r for r, _ in parsed_cache}
+
+    def _resolve_out_rel(truth_rel: str, truth_file: dict[str, Any]) -> str:
+        if truth_rel in parsed_rels:
+            return truth_rel
+        in_p = input_root / truth_rel
+        if in_p.is_file():
+            disk_sha = hashlib.sha256(in_p.read_bytes()).hexdigest()
+            if disk_sha in sha_to_out_rel:
+                return sha_to_out_rel[disk_sha]
+        t_sha = str(truth_file.get("sha256") or "")
+        return sha_to_out_rel.get(t_sha, truth_rel)
+
     # Pool evidence per pseudonym (A4) and per patient
     profiles: dict[str, ExtractedProfile] = {}
     pt_to_psn: dict[str, set[str]] = defaultdict(set)
     for rel, f in truth["files"].items():
+        out_rel = _resolve_out_rel(rel, f)
         for loc, tu in f["units"].items():
             pt = tu.get("patient")
-            if not pt or (rel, loc) not in parsed_cache:
+            if not pt or (out_rel, loc) not in parsed_cache:
                 continue
-            psn = rec_map.get((rel, loc)) or f"UNLINKED::{rel}::{loc}"
+            psn = rec_map.get((out_rel, loc)) or f"UNLINKED::{out_rel}::{loc}"
             pt_to_psn[pt].add(psn)
             prof = profiles.setdefault(psn, ExtractedProfile(pseudonym=psn))
-            fd, rtxt = parsed_cache[(rel, loc)]
-            _extract_profile_evidence(fd, rtxt, rel, date_orders, prof, qi_only=qi_only)
+            fd, rtxt = parsed_cache[(out_rel, loc)]
+            _extract_profile_evidence(fd, rtxt, out_rel, date_orders, prof, qi_only=qi_only)
 
     # A4 Profile re-identification (>= 0.5 confidence) & A2/A3 mean true-person probability
     reid_probs: list[float] = []
@@ -504,10 +526,11 @@ def run_attack_audit(
     bad_age_bands = 0
     checked_ages = 0
     for rel, f in truth["files"].items():
+        out_rel = _resolve_out_rel(rel, f)
         for loc, tu in f["units"].items():
-            if (rel, loc) not in parsed_cache:
+            if (out_rel, loc) not in parsed_cache:
                 continue
-            fd, rtxt = parsed_cache[(rel, loc)]
+            fd, rtxt = parsed_cache[(out_rel, loc)]
             for fld in tu.get("fields") or []:
                 if fld["kind"] == "age":
                     true_age = fld["true"]
@@ -523,14 +546,15 @@ def run_attack_audit(
     stay_checked = 0
     stay_bad = 0
     for rel, f in truth["files"].items():
+        out_rel = _resolve_out_rel(rel, f)
         for loc, tu in f["units"].items():
-            if (rel, loc) not in parsed_cache:
+            if (out_rel, loc) not in parsed_cache:
                 continue
             adm_t = [dt.date.fromisoformat(d["true"]) for d in tu.get("dates") or [] if d["event"] == "admission"]
             dis_t = [dt.date.fromisoformat(d["true"]) for d in tu.get("dates") or [] if d["event"] == "discharge"]
             if adm_t and dis_t:
                 true_stay = (dis_t[0] - adm_t[0]).days
-                psn = rec_map.get((rel, loc))
+                psn = rec_map.get((out_rel, loc))
                 if psn and psn in profiles:
                     stay_checked += 1
                     if true_stay not in profiles[psn].stay_lengths:
