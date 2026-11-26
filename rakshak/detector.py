@@ -346,6 +346,7 @@ def clean_free_text(
     plan: PrivacyPlan | None = None,
     clean_only_direct_ids: bool = False,
     hospital_hint: str = "",
+    preferred_order: str | None = None,
 ) -> str:
     """Detect and redact PII in free text while protecting clinical meaning traps."""
     if not text or _FAST_SAFE_TOKEN_RX.fullmatch(text):
@@ -407,6 +408,7 @@ def clean_free_text(
             plan.date_shift_days,
             hospital_hint=hospital_hint,
             is_suppressed=(plan.generalization_level != "standard"),
+            preferred_order=preferred_order,
         )
         work = _shift_month_name_dates(work, plan.date_shift_days)
         work = generalize_ages_in_text(work, plan)
@@ -421,10 +423,11 @@ def shift_dates_in_text(
     shift_days: int,
     hospital_hint: str = "",
     is_suppressed: bool = False,
+    preferred_order: str | None = None,
 ) -> str:
     """Shift date tokens inside free text while preserving original formatting style."""
     date_rx = re.compile(r"(?<!\d)(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})(?!\d)")
-    preferred = "mdy" if hospital_hint == "ass" else "dmy"
+    preferred = preferred_order if preferred_order in ("dmy", "mdy") else "dmy"
     # Infer file-level order quickly
     dmy_v = mdy_v = 0
     shadow = text.translate(_DEVA_DIGITS)
@@ -597,7 +600,13 @@ def sanitize_structured_cell(
         return "[DOB]"
     if role in (ROLE_DATE, ROLE_ADMISSION_DATE, ROLE_DISCHARGE_DATE):
         if plan is not None:
-            return shift_dates_in_text(value, plan.date_shift_days, hospital_hint=hospital_hint, is_suppressed=is_suppressed)
+            return shift_dates_in_text(
+                value,
+                plan.date_shift_days,
+                hospital_hint=hospital_hint,
+                is_suppressed=is_suppressed,
+                preferred_order=date_order if date_order in ("dmy", "mdy") else None,
+            )
         return value
     if role == ROLE_AGE:
         if norm_val.lstrip().startswith("-"):

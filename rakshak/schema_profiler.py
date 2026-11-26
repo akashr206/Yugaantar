@@ -329,9 +329,6 @@ def infer_date_order_from_samples(raw_name: str, samples: list[str], hospital_hi
         return "dmy"
     if mdy_votes > dmy_votes:
         return "mdy"
-    # Arogya Seva Sadan uses MDY in legacy CSV / discharge / nursing / rx (billing claims use DMY caught above)
-    if hospital_hint == "ass":
-        return "mdy"
     return "dmy"
 
 

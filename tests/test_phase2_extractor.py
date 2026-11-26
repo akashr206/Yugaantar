@@ -104,6 +104,31 @@ class TestPhase2Extractor(unittest.TestCase):
         self.assertIn("kgmu26009912", clue.mrns)
         self.assertIn("sgpgi882210", clue.mrns)
 
+    def test_unseen_facility_pooled_mdy_inference_without_hardcoding(self) -> None:
+        units = [
+            RecordUnit(
+                unit_id="notes/mercy_01.txt::doc",
+                file_rel="notes/mercy_01.txt",
+                loc="doc",
+                format_type="txt",
+                hospital_hint="mercy_memorial_hospital",
+                raw_text="Mercy Memorial Hospital\nDate of Admission: 09/26/2026\n",
+            ),
+            RecordUnit(
+                unit_id="notes/mercy_02.txt::doc",
+                file_rel="notes/mercy_02.txt",
+                loc="doc",
+                format_type="txt",
+                hospital_hint="mercy_memorial_hospital",
+                raw_text="Mercy Memorial Hospital\nDate of Admission: 02/01/2026\nDate of Discharge: 02/06/2026\n",
+            ),
+        ]
+        orders = infer_file_date_orders(units)
+        self.assertEqual(orders[("notes/mercy_01.txt", "__doc__")], "mdy")
+        self.assertEqual(orders[("notes/mercy_02.txt", "__doc__")], "mdy")
+        clues = extract_all_clues(units)
+        self.assertEqual([d.iso_date for d in clues[1].dates], ["2026-02-01", "2026-02-06"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,9 +7,22 @@ and Option C adaptive k-anonymity planning.
 from __future__ import annotations
 
 from rakshak.clue_extractor import extract_clues_for_unit, infer_file_date_orders
-from rakshak.contracts import PolicyConfig, PrivacyPlan, RecordUnit
+from rakshak.contracts import IdentityClues, PolicyConfig, PrivacyPlan, RecordUnit
 from rakshak.linkage import link_records
 from rakshak.privacy import build_privacy_plans
+
+
+def plan_privacy_full(
+    units: list[RecordUnit],
+    policy: PolicyConfig,
+    secret: bytes,
+) -> tuple[dict[str, PrivacyPlan], dict[tuple[str, str], str], list[IdentityClues]]:
+    """Run clue extraction, identity linkage, and adaptive k-anonymity planning."""
+    date_orders = infer_file_date_orders(units)
+    clues = [extract_clues_for_unit(u, date_orders) for u in units]
+    cluster_map = link_records(clues)
+    plans = build_privacy_plans(clues, cluster_map, policy, secret)
+    return plans, date_orders, clues
 
 
 def plan_privacy_with_date_orders(
@@ -18,10 +31,7 @@ def plan_privacy_with_date_orders(
     secret: bytes,
 ) -> tuple[dict[str, PrivacyPlan], dict[tuple[str, str], str]]:
     """Run clue extraction, identity linkage, and adaptive k-anonymity planning."""
-    date_orders = infer_file_date_orders(units)
-    clues = [extract_clues_for_unit(u, date_orders) for u in units]
-    cluster_map = link_records(clues)
-    plans = build_privacy_plans(clues, cluster_map, policy, secret)
+    plans, date_orders, _ = plan_privacy_full(units, policy, secret)
     return plans, date_orders
 
 

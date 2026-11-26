@@ -142,33 +142,83 @@ def _safe_int_age(raw: Any) -> int | None:
 def infer_file_date_orders(units: list[RecordUnit]) -> dict[tuple[str, str], str]:
     """Infer DMY vs MDY vs ISO per (file_rel, field_key_or_doc) across all units in a batch.
 
-    Examines all slash/dash dates in the same file+column to disambiguate DMY vs MDY
-    before parsing individual records.
+    Uses explicit column hints and per-(file, field) unambiguous dates first, then pools
+    unambiguous evidence across files sharing the same inferred facility and format, and
+    finally checks intra-record admission/discharge ordering before defaulting to DMY.
     """
     evidence: dict[tuple[str, str], list[tuple[int, int, str, str]]] = defaultdict(list)
+    file_votes: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # [dmy, mdy]
+    fac_fmt_votes: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+    root_fmt_votes: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+    fac_votes: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    root_votes: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    file_meta: dict[str, tuple[str, str]] = {}
 
-    def _collect(file_rel: str, field_key: str, text: str, hosp: str) -> None:
+    def _collect(file_rel: str, field_key: str, text: str, hosp: str, fmt: str) -> None:
         s = normalize_digits(text)
+        file_meta.setdefault(file_rel, (hosp, fmt))
+        hosp_root = hosp.split("_", 1)[0] if hosp else ""
         for m in _SLASH_DATE_RE.finditer(s):
             p1, p2 = int(m.group(1)), int(m.group(3))
             evidence[(file_rel, field_key)].append((p1, p2, hosp, field_key))
+            if p1 > 12:
+                file_votes[file_rel][0] += 1
+                if hosp:
+                    fac_fmt_votes[(hosp, fmt)][0] += 1
+                    fac_votes[hosp][0] += 1
+                if hosp_root:
+                    root_fmt_votes[(hosp_root, fmt)][0] += 1
+                    root_votes[hosp_root][0] += 1
+            elif p2 > 12:
+                file_votes[file_rel][1] += 1
+                if hosp:
+                    fac_fmt_votes[(hosp, fmt)][1] += 1
+                    fac_votes[hosp][1] += 1
+                if hosp_root:
+                    root_fmt_votes[(hosp_root, fmt)][1] += 1
+                    root_votes[hosp_root][1] += 1
 
+    # Semantic pair tie-breaker: check if admission <= discharge disambiguates DMY vs MDY
+    pair_votes: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     for u in units:
         if u.structured_fields and u.format_type in ("csv", "tsv"):
             for k, v in u.structured_fields.items():
                 if isinstance(v, str):
-                    _collect(u.file_rel, k, v, u.hospital_hint)
+                    _collect(u.file_rel, k, v, u.hospital_hint, u.format_type)
         elif u.structured_fields and u.format_type == "json":
             for k, v in u.structured_fields.items():
                 if isinstance(v, str):
-                    _collect(u.file_rel, k, v, u.hospital_hint)
+                    _collect(u.file_rel, k, v, u.hospital_hint, u.format_type)
         else:
-            _collect(u.file_rel, "__doc__", u.raw_text, u.hospital_hint)
+            _collect(u.file_rel, "__doc__", u.raw_text, u.hospital_hint, u.format_type)
+
+        if u.structured_fields:
+            adm_raw = next((str(v) for k, v in u.structured_fields.items() if "admis" in k.lower() and v), None)
+            dis_raw = next((str(v) for k, v in u.structured_fields.items() if "disch" in k.lower() and v), None)
+            if adm_raw and dis_raw:
+                d_adm = parse_date_string(adm_raw, "dmy")
+                d_dis = parse_date_string(dis_raw, "dmy")
+                m_adm = parse_date_string(adm_raw, "mdy")
+                m_dis = parse_date_string(dis_raw, "mdy")
+                d_ok = d_adm is not None and d_dis is not None and d_adm <= d_dis
+                m_ok = m_adm is not None and m_dis is not None and m_adm <= m_dis
+                if d_ok and not m_ok:
+                    pair_votes[u.file_rel][0] += 1
+                elif m_ok and not d_ok:
+                    pair_votes[u.file_rel][1] += 1
+
+    def _pick(counts: list[int] | None) -> str | None:
+        if not counts:
+            return None
+        if counts[0] > counts[1]:
+            return "dmy"
+        if counts[1] > counts[0]:
+            return "mdy"
+        return None
 
     orders: dict[tuple[str, str], str] = {}
     for (file_rel, field_key), samples in evidence.items():
         low_key = field_key.lower()
-        low_file = file_rel.lower()
         if "mm/dd" in low_key or "mdy" in low_key:
             orders[(file_rel, field_key)] = "mdy"
             continue
@@ -179,15 +229,23 @@ def infer_file_date_orders(units: list[RecordUnit]) -> dict[tuple[str, str], str
         saw_p2_gt12 = any(p2 > 12 for _, p2, _, _ in samples)
         if saw_p1_gt12 and not saw_p2_gt12:
             orders[(file_rel, field_key)] = "dmy"
-        elif saw_p2_gt12 and not saw_p1_gt12:
+            continue
+        if saw_p2_gt12 and not saw_p1_gt12:
             orders[(file_rel, field_key)] = "mdy"
-        else:
-            hosp = samples[0][2] if samples else ""
-            # Arogya clinical notes/legacy exports default MDY; billing/other hospitals default DMY
-            if hosp == "ass" and "billing" not in low_file and "claims" not in low_file:
-                orders[(file_rel, field_key)] = "mdy"
-            else:
-                orders[(file_rel, field_key)] = "dmy"
+            continue
+
+        hosp, fmt = file_meta.get(file_rel, ("", ""))
+        hosp_root = hosp.split("_", 1)[0] if hosp else ""
+        resolved = (
+            _pick(file_votes.get(file_rel))
+            or _pick(fac_fmt_votes.get((hosp, fmt)))
+            or _pick(root_fmt_votes.get((hosp_root, fmt)))
+            or _pick(fac_votes.get(hosp))
+            or _pick(root_votes.get(hosp_root))
+            or _pick(pair_votes.get(file_rel))
+            or "dmy"
+        )
+        orders[(file_rel, field_key)] = resolved
     return orders
 
 

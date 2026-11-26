@@ -86,6 +86,9 @@ def _extract_csv_dates(row: list[str], profiles: list, loc: str) -> tuple[DateMe
 
 def _extract_json_dates_from_obj(obj: dict[str, Any], hospital_hint: str) -> tuple[DateMention, ...]:
     mentions: list[DateMention] = []
+    # Infer unambiguous DMY vs MDY across string values in this JSON object
+    dmy_v = mdy_v = 0
+    raw_pairs: list[tuple[str, str, str]] = []
     stack: list[tuple[str, Any]] = [("", obj)]
     while stack:
         prefix, cur = stack.pop()
@@ -95,26 +98,37 @@ def _extract_json_dates_from_obj(obj: dict[str, Any], hospital_hint: str) -> tup
                 if isinstance(v, str) and v.strip():
                     low = k.lower()
                     if any(t in low for t in ("dob", "birthdate", "date", "collected", "timestamp", "recordeddate", "authoredon", "start", "end")):
-                        parsed = parse_date_string(v, preferred_order="iso" if "-" in v[:5] else ("mdy" if hospital_hint == "ass" else "dmy"))
-                        if parsed:
-                            role = "dob" if ("dob" in low or "birth" in low) else (
-                                "admission" if low == "start" else ("discharge" if low == "end" else "clinical")
-                            )
-                            mentions.append(
-                                DateMention(
-                                    raw_text=v,
-                                    iso_date=parsed.isoformat(),
-                                    role=role,
-                                    date_order="iso" if "-" in v[:5] else "dmy",
-                                    field_path=path,
-                                )
-                            )
+                        raw_pairs.append((path, low, v))
+                        parts = re.split(r"[-/.]", v.strip().translate(_DEVA_DIGITS))
+                        if len(parts) == 3 and len(parts[0]) != 4 and all(p.isdigit() for p in parts[:2]):
+                            p1, p2 = int(parts[0]), int(parts[1])
+                            if p1 > 12:
+                                dmy_v += 1
+                            elif p2 > 12:
+                                mdy_v += 1
                 elif isinstance(v, (dict, list)):
                     stack.append((path, v))
         elif isinstance(cur, list):
             for idx, item in enumerate(cur):
                 if isinstance(item, (dict, list)):
                     stack.append((f"{prefix}/{idx}", item))
+    obj_order = "mdy" if mdy_v > dmy_v else "dmy"
+    for path, low, v in raw_pairs:
+        order = "iso" if "-" in v[:5] else obj_order
+        parsed = parse_date_string(v, preferred_order=order)
+        if parsed:
+            role = "dob" if ("dob" in low or "birth" in low) else (
+                "admission" if low == "start" else ("discharge" if low == "end" else "clinical")
+            )
+            mentions.append(
+                DateMention(
+                    raw_text=v,
+                    iso_date=parsed.isoformat(),
+                    role=role,
+                    date_order=order,
+                    field_path=path,
+                )
+            )
     return tuple(mentions)
 
 
@@ -228,6 +242,7 @@ def _sanitize_json_scalar(
     clean_doc: bool,
     inside_practitioner: bool = False,
     parent_key: str = "",
+    file_date_orders: dict[str, str] | None = None,
 ) -> Any:
     """Sanitize a scalar JSON leaf while keeping value types valid where required."""
     if clean_doc:
@@ -306,9 +321,15 @@ def _sanitize_json_scalar(
         return clean_free_text(val, stats, plan=None, clean_only_direct_ids=True, hospital_hint=hospital_hint)
 
     if prof.role != ROLE_UNKNOWN:
-        return sanitize_structured_cell(val, prof.role, prof.date_order, plan, stats, hospital_hint=hospital_hint)
+        resolved_order = prof.date_order
+        if file_date_orders and prof.date_order != "iso":
+            low_k = key.lower()
+            if not any(h in low_k for h in ("mm/dd", "dd/mm", "yyyy-mm-dd", "mdy", "dmy", "iso")):
+                resolved_order = file_date_orders.get(key) or file_date_orders.get("__doc__") or prof.date_order
+        return sanitize_structured_cell(val, prof.role, resolved_order, plan, stats, hospital_hint=hospital_hint)
 
-    return clean_free_text(val, stats, plan=plan, hospital_hint=hospital_hint)
+    doc_order = file_date_orders.get("__doc__") if file_date_orders else None
+    return clean_free_text(val, stats, plan=plan, hospital_hint=hospital_hint, preferred_order=doc_order)
 
 
 @lru_cache(maxsize=4096)
@@ -327,6 +348,7 @@ def _sanitize_json_iterative(
     stats: DetectionStats,
     hospital_hint: str,
     clean_doc: bool,
+    file_date_orders: dict[str, str] | None = None,
 ) -> Any:
     """Iteratively sanitize a JSON container without Python recursion limits."""
     def _clean_key(k: str) -> str:
@@ -338,7 +360,7 @@ def _sanitize_json_iterative(
         return c
 
     if not isinstance(root, (dict, list)):
-        return _sanitize_json_scalar("", root, plan, stats, hospital_hint, clean_doc)
+        return _sanitize_json_scalar("", root, plan, stats, hospital_hint, clean_doc, file_date_orders=file_date_orders)
 
     new_root: Any = {} if isinstance(root, dict) else []
     # Stack items: (src_node, dst_node, parent_key, inside_protected_resource)
@@ -375,6 +397,7 @@ def _sanitize_json_iterative(
                         clean_doc,
                         inside_practitioner=is_prac_obj,
                         parent_key=pkey,
+                        file_date_orders=file_date_orders,
                     )
         elif isinstance(src, list):
             for item in src:
@@ -397,6 +420,7 @@ def _sanitize_json_iterative(
                             clean_doc,
                             inside_practitioner=in_prac,
                             parent_key=pkey,
+                            file_date_orders=file_date_orders,
                         )
                     )
     return new_root
@@ -407,9 +431,10 @@ def _sanitize_fhir_bundle(
     plan: PrivacyPlan,
     stats: DetectionStats,
     hospital_hint: str,
+    file_date_orders: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Sanitize a FHIR R4 Document Bundle while keeping references valid and Patient PSN injected."""
-    cleaned = _sanitize_json_iterative(bundle, plan, stats, hospital_hint, clean_doc=False)
+    cleaned = _sanitize_json_iterative(bundle, plan, stats, hospital_hint, clean_doc=False, file_date_orders=file_date_orders)
     if not isinstance(cleaned, dict):
         return cleaned
 
@@ -510,11 +535,13 @@ def render_sanitized_file(
     plans: dict[str, PrivacyPlan],
     records_out: list[dict[str, Any]],
     stats: DetectionStats,
+    date_orders: dict[tuple[str, str], str] | None = None,
 ) -> str:
     """Render one sanitized file and append its records.jsonl entries."""
     rel = item.file_rel
     out_rel = item.clean_rel
     clean_doc: bool = bool(ctx.get("clean_doc", False))
+    file_orders = {fk: ord_v for (frel, fk), ord_v in (date_orders or {}).items() if frel == rel}
 
     if item.format_type in ("csv", "tsv"):
         delim, header, body = item.parsed
@@ -554,9 +581,10 @@ def render_sanitized_file(
                 for j, cell in enumerate(row):
                     if j < len(profiles):
                         prof = profiles[j]
+                        col_order = file_orders.get(prof.raw_name, prof.date_order)
                         cleaned_row.append(
                             sanitize_structured_cell(
-                                cell, prof.role, prof.date_order, plan, stats, hospital_hint=item.hospital_hint
+                                cell, prof.role, col_order, plan, stats, hospital_hint=item.hospital_hint
                             )
                         )
                     else:
@@ -584,7 +612,7 @@ def render_sanitized_file(
         is_doc: bool = bool(ctx.get("is_doc", True))
         if item.format_type == "fhir":
             plan = plans[f"{rel}::doc"]
-            out_obj = _sanitize_fhir_bundle(data, plan, stats, item.hospital_hint)
+            out_obj = _sanitize_fhir_bundle(data, plan, stats, item.hospital_hint, file_date_orders=file_orders)
             records_out.append(
                 {
                     "file": f"sanitized/{out_rel}",
@@ -597,7 +625,7 @@ def render_sanitized_file(
 
         if is_doc:
             plan = plans[f"{rel}::doc"]
-            out_obj = _sanitize_json_iterative(data, plan, stats, item.hospital_hint, clean_doc)
+            out_obj = _sanitize_json_iterative(data, plan, stats, item.hospital_hint, clean_doc, file_date_orders=file_orders)
             if not clean_doc and plan.pseudonym and isinstance(out_obj, dict):
                 # Inject pseudonym into patient sub-object or top-level ref without changing key structure wildly
                 if isinstance(out_obj.get("patient"), dict) and "hospital_uhid" in out_obj["patient"]:
@@ -617,7 +645,7 @@ def render_sanitized_file(
             return json.dumps(out_obj, ensure_ascii=False, indent=2) + "\n"
 
         # Multi-record JSON (e.g. opd/*.json, registration/dhh_patients.json, lab/bulk_lab_export.json)
-        out_root = _sanitize_json_iterative(data, None, stats, item.hospital_hint, clean_doc)
+        out_root = _sanitize_json_iterative(data, None, stats, item.hospital_hint, clean_doc, file_date_orders=file_orders)
         # Re-sanitize each record item with its specific RecordUnit PrivacyPlan
         for k, v in list(data.items()):
             if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
@@ -627,7 +655,7 @@ def render_sanitized_file(
                     loc = f"/{pointer_key}/{i}"
                     plan = plans[f"{rel}::{loc}"]
                     cleaned_item = _sanitize_json_iterative(
-                        item_dict, plan, stats, item.hospital_hint, clean_doc
+                        item_dict, plan, stats, item.hospital_hint, clean_doc, file_date_orders=file_orders
                     )
                     if not clean_doc and plan.pseudonym and isinstance(cleaned_item, dict):
                         if "patient_ref" in cleaned_item:
@@ -656,6 +684,7 @@ def render_sanitized_file(
         plan=None if clean_doc else plan,
         clean_only_direct_ids=clean_doc,
         hospital_hint=item.hospital_hint,
+        preferred_order=file_orders.get("__doc__"),
     )
     if not clean_doc and plan.pseudonym:
         cleaned_txt = f"Patient: {plan.pseudonym}\n{cleaned_txt}"

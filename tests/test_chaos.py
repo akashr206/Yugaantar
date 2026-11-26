@@ -56,6 +56,47 @@ class TestIngestionAndTraps(unittest.TestCase):
         self.assertFalse(renamed_3)
         self.assertEqual(clean_3, "clean/dengue_management_protocol.txt")
 
+        # Unseen hospital ID prefixes, Indic digits, Devanagari, URL-encoded, and base64 segments
+        clean_4, renamed_4 = sanitize_rel_path("notes/KPR-99-887766_summary.txt", SECRET)
+        self.assertTrue(renamed_4)
+        self.assertNotIn("887766", clean_4)
+
+        clean_5, renamed_5 = sanitize_rel_path("lab/९८७६५४३२१०_report.json", SECRET)
+        self.assertTrue(renamed_5)
+        self.assertNotIn("९८७६५४३२१०", clean_5)
+
+        clean_6, renamed_6 = sanitize_rel_path("notes/महेश_चौहान.txt", SECRET)
+        self.assertTrue(renamed_6)
+
+        import base64
+        b64_name = base64.urlsafe_b64encode(b"Fatima_Bano_9876543210").decode("ascii").rstrip("=")
+        clean_7, renamed_7 = sanitize_rel_path(f"notes/{b64_name}.txt", SECRET)
+        self.assertTrue(renamed_7)
+        self.assertNotIn(b64_name, clean_7)
+
+    def test_lowercase_filename_pii_caught_via_pass1_clues(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            inp = root / "in"
+            out = root / "out"
+            (inp / "notes").mkdir(parents=True)
+            (inp / "notes" / "john_doe_followup.txt").write_text(
+                "Mercy Memorial Hospital\n"
+                "Patient Name: John Doe  Age/Sex: 42 Yrs/M\n"
+                "Diagnosis: Viral fever.\n",
+                encoding="utf-8",
+            )
+            (inp / "notes" / "anita_summary.txt").write_text(
+                "Mercy Memorial Hospital\n"
+                "Patient Name: Anita Verma  Age/Sex: 35 Yrs/F\n"
+                "Diagnosis: Migraine.\n",
+                encoding="utf-8",
+            )
+            run_pipeline(inp, out, PolicyConfig(), SECRET)
+            exported_names = [p.name for p in (out / "sanitized").rglob("*") if p.is_file()]
+            self.assertFalse(any("john" in n.lower() or "doe" in n.lower() for n in exported_names))
+            self.assertFalse(any("anita" in n.lower() for n in exported_names))
+
     def test_meaning_traps_preserved_and_pii_redacted(self) -> None:
         sample = (
             "Patient Name: Ramesh Yadav        Age/Sex: 65 Yrs/M\n"
