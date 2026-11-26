@@ -1,6 +1,7 @@
-# The starter uses only the Python standard library.
-# Add what you need, for example:
-# rapidfuzz
-# jellyfish
-# indic-transliteration
-# cryptography
+# Offline-safe, CPU-only packages (no LLMs or >50M-param transformers)
+rapidfuzz>=3.6.0
+jellyfish>=1.0.0
+indic-transliteration>=2.3.50
+cryptography>=42.0.0
+python-dateutil>=2.8.2
+PyYAML>=6.0.1

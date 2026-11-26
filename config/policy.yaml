@@ -1,4 +1,8 @@
-# Your privacy rules. main.py reads simple "key: value" lines.
-age_band_years: 5          # ages become bands like 45-49 (the band must contain the true age)
-date_shift_max_days: 180   # every date of one patient moves by the same secret offset
-min_group_size: 5          # TODO: suppress or widen quasi-identifier combos rarer than this (k-anonymity)
+# Privacy rules (Option C: Adaptive k-Anonymity Widening)
+age_band_years: 5            # default 5-year age bands (must contain true age)
+date_shift_max_days: 180     # per-patient secret date shift in [-180, +180], non-zero
+min_group_size: 5            # k-anonymity threshold for (age_band, gender, district)
+rare_condition_threshold: 3  # conditions appearing in <= N patients trigger widening
+pin_prefix_digits: 3         # retain 3-digit PIN prefix (e.g. 226***) for normal cells
+max_age_cap: 85              # ages >= max_age_cap map to 85+ band (or wider if needed)
+adaptive_widening: true      # widen age/suppress PIN or district only on small/rare cells
