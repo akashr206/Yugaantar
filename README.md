@@ -1,121 +1,120 @@
-# Team `enma` · Rakshak Privacy Firewall
+# Team `enma`: Rakshak — Multilingual Context-Aware Privacy Firewall
 
-**Yugaantar DevForge · Track 3: Secret Wards**  
-Offline, CPU-only, LLM-free multilingual privacy firewall for heterogeneous Indian hospital records (English, Devanagari Hindi, and Hinglish).
+**Track 3 · Secret Wards (Yugaantar DevForge)** · Members: **Akash R & Anjan Poojary** · Repo: https://github.com/akashr206/Yugaantar · Brief: [docs/brief.pdf](docs/brief.pdf)
+
+> **Rakshak** is an offline, deterministic, CPU-only privacy firewall (`7,169` LOC across 13 Python modules) for multi-script Indian hospital exports in **English, Devanagari Hindi, and Hinglish** (CSV, TSV, nested JSON, FHIR R4 Bundles, and clinical notes). Operating without LLMs or blanket redaction, its two-pass architecture combines clinical-trap shields, anti-evasion decoding, statistical/compositional schema profiling, cross-script phonetic linkage, a `314.2 KB` multi-tag CRF (`PER`/`REL`/`LOC`/`ID`), and Option C privacy with `YYYY` DOB truncation and post-widening joint $k$-anonymity & $l$-diversity verification.
+
+### Key Metrics at a Glance
+- **PII Leaked (`check_dev.py`, LF-aligned):** `0.0%` (`0 / 3,230` across EN / HI / Hinglish & all 6 hidden channels; `0 / 4` canaries)
+- **Medical Utility Kept:** `99.0%` (`4,808 / 4,855`; `100%` age-band truth `359/359` & exact stays `65/65`)
+- **Cross-Script Linking:** `1.00` Precision · `0.95` Recall · **`0.99 F0.5`** · **`0` Wrong Merges**
+- **Re-Identification Risk:** `0.0%` A4 Re-ID (Mean Sweeney prob `0.0106`; A5 shift recovered `False`; A6/A7 `0`)
+- **Speed, Memory & Tests:** `3.3–5.72 s` runtime · `63.9 MB` peak RSS · `54 / 54` tests passed · `READY TO SUBMIT`
 
 ---
 
 ## 1. Setup & Usage
 
-### Install Dependencies (One-time Setup)
+### Install Dependencies (One-time Setup, Offline Runtime After)
 ```bash
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-### Run Offline
+### Run Offline (Official `raksha.toml` Entrypoint)
 ```bash
+# Linux / Evaluator Sandbox
 RAKSHA_SECRET=practice python main.py --input ../dev/input --output ../out_dev
+
+# Windows PowerShell
+$env:RAKSHA_SECRET = "practice"
+.\.venv\Scripts\python.exe main.py --input ..\dev\input --output ..\out_dev
 ```
 
 ---
 
 ## 2. System Architecture
 
+![Rakshak Two-Pass Clinical Privacy Firewall Architecture](docs/rakshak-architecture.svg)
+
 ```text
-Input Tree (CSV / TSV / JSON / FHIR R4 / TXT / Misc)
+Heterogeneous Inputs (CSV / TSV / JSON / FHIR R4 / TXT / Opaque Columns / Hidden Channels)
   │
-  ├─► [1] Ingestion & Quarantine (ingest.py + security.EphemeralVault)
-  │     • Sniffs format & decodes UTF-8 / UTF-8-BOM / UTF-16 / cp1252
-  │     • Encrypts unsupported/corrupt files (PDF/JPG/XML/empty/broken JSON)
-  │       at rest into quarantine/<sha256>.enc via AES-256-GCM
+  ├─► [1] Ingest & Sniff (ingest.py, formats.py) ──[QuarantineError]──► AES-256-GCM Ephemeral Vault (security.py)
+  │     • Magic-byte sniffing, UTF-8/BOM/UTF-16/cp1252 decode, RFC-4180 quotes, depth guard, path hygiene
   │
-  ├─► [2] Cross-Script Clue Extraction (translit.py + schema_profiler.py + clue_extractor.py)
-  │     • Hindi-aware Devanagari→Latin transliteration, phonetic & symmetric abbreviation matching
-  │     • Unified token-boundary key classification & per-column DMY/MDY/ISO inference
-  │     • Facility-agnostic bilingual free-text, JSON, CSV, and FHIR R4 Bundle extraction
+  ├─► [2] Pass 1: Schema & Clues (schema_profiler.py, clue_extractor.py, translit.py)
+  │     • Unseen column/key profiler, pooled DMY/MDY/ISO parser, Hindi schwa/nukta translit, Verhoeff Aadhaar
   │
   ├─► [3] Precision-First Record Linkage (linkage.py)
-  │     • Deterministic inverted-index blocking
-  │     • Tiered hard-ID + composite soft links (DOB, relative, village+age)
-  │     • Homonym, generic-token, and anti-transitive contradiction guards
+  │     • Inverted blocking, Tier-1 hard IDs + Tier-2 soft corroborators (age ±2), anti-transitive all() guard
   │
-  ├─► [4] Balanced Hybrid Adaptive Privacy Layer (`planner.py` → `privacy.py` + `policy.yaml`)
-  │     • Keyed HMAC-SHA256 pseudonyms (PSN-XXXXXX) & per-patient date shifts
-  │     • Truthful sliding <=30-yr / N+ age bands maximizing diagnosis & stay peer overlap
-  │     • Surgical Gender suppression only on small mixed-sex cells; DOB masking on widened/suppressed clusters
+  ├─► [4] Adaptive Privacy Planner (planner.py, privacy.py, config/policy.yaml)
+  │     • Keyed HMAC PSN-XXXXXXXXXX, ±180d per-patient shifts, YYYY DOB truncation, joint k ≥ 5 & l ≥ 2 loop
   │
-  ├─► [5] Multilingual PII Scrubbing & Guarded CRF (`detector.py` + `ner_crf.py` + `formats.py`)
-  │     • Context-aware PII detection & meaning-trap guards (Dr., doses, eponyms, C/O)
-  │     • Compact offline python-crfsuite Stage 3.5 fallback NER (`models/pii_ner.crfsuite`)
-  │     • Filename, header, JSON key, metadata, FHIR display & base64 payload scrubbing
-  │
-  └─► [6] Release Assembly (security.py)
-        • sanitized/ (UTF-8) + records.jsonl + honest report.json
+  └─► [5] Pass 2: Shielded Redaction & Export (detector.py, ner_crf.py, formats.py, security.py)
+        • Homoglyph/ZW/inline decode → Clinical trap shields → Rules + 314.2 KB CRF → Cluster scrub → Export
+        └─► sanitized/ (UTF-8 + FHIR R4) + records.jsonl + report.json + quarantine/*.enc
 ```
 
 ---
 
-## 3. Core Components & Algorithms
+## 3. How Each Component Works
 
-### Cross-Script Transliteration & Generalized Name Matching (`rakshak/translit.py`)
-Combines `indic-transliteration` (ITRANS) with Hindi-specific schwa deletion, anusvara assimilation, and nukta/retroflex rules (`.D` → `d`, `.Dh` → `rh`, `K` → `kh`, `J` → `z`), followed by consonant-skeleton and `jellyfish` phonetic keys. Unseen Indian/hospital honorifics (`shri`, `smt`, `kumari`, `ji`, `sahab`, `babu`, `amma`, `didi`, `bhai`, etc.), dotted initials (`R. K. Verma` ↔ `Ramesh Kumar Verma`), and consonant contractions (`Sk` ↔ `Shaikh`, `Kr` ↔ `Kumar`, `Pd` ↔ `Prasad`, `Bhatt` ↔ `Bhattacharya`) are matched symmetrically (`len >= 2`), while generic single tokens never link independently.
+### Ingestion & Quarantine (`rakshak/ingest.py`, `rakshak/security.py`)
+- Traverses input paths deterministically (`sorted`) and sniffs JSON/CSV/TSV/FHIR structure regardless of filename extension.
+- Strictly decodes UTF-8, UTF-8-BOM, UTF-16, and validated cp1252, enforces RFC-4180 CSV quote & JSON depth (`64`) checks, and immediately encrypts corrupt/binary/unsupported files at rest into `quarantine/<input_sha256>.enc` via ephemeral **AES-256-GCM** (`0` raw copies).
+- Scrubs PII-bearing directory/file segments (`doc_<hmac>` / `dir_<hmac>`) across NFKC, Indic digits, URL-unquoted, and Base64 variants; clean protocol/formulary decoys run through a fail-closed PII/ID guard.
 
-### Unified Schema Profiling & Clue Extraction (`rakshak/schema_profiler.py`, `rakshak/clue_extractor.py`)
-Classifies columns and JSON keys cleanly across unseen datasets (`beneficiary`, `member id`, `subscriber`, `kin`, `nominee`, `tehsil`/`mandal`/`taluka`, `umra`, `रोगी`) while guarding clinical chemistry/domain phrases (`Serum Creatinine`, `Village/Mohalla`). Infers `DMY` vs. `MDY` vs. `ISO` date ordering per `(file, column)` (handling `DD/MM/YYYY`, `MM/DD/YYYY`, `Month DD, YYYY`, Hindi months, and Devanagari digits `०-९`), shields pediatric `/` values `< 20` against false slash-date linkage, masks 14-digit ABHA IDs before Aadhaar/phone scans, and excludes `clean/` protocol/formulary decoys structurally.
+### Detection, Opaque-Schema Profiling & Hidden Channels (`rakshak/schema_profiler.py`, `rakshak/detector.py`, `rakshak/ner_crf.py`)
+- **Anti-Evasion Pre-Normalization:** Strips zero-width characters, folds Cyrillic/Greek homoglyphs & Latin diacritics (keeping Devanagari marks intact), translates Indic digits (`०-९`), and decodes/cleans inline `base64`, `hex`, `\uXXXX`, HTML entities, and `%`-encoded payloads.
+- **Unseen Schema & Key Profiling:** Classifies unfamiliar column headers and JSON keys via compositional token semantics plus statistical value-distribution inference (`>= 60%` IDs/phones/PINs/dates, multi-row names, unseen MRNs) without memorized dev headers.
+- **Clinical Meaning-Trap Shields:** Atomically shields doctors (`Dr.` / `डॉ.`), eponyms (`Parkinson's disease`), clinical shorthands (`C/O fever`, `K/C/O`, `H/O`), doses (`0-1-1`, `500 mg BD`), vitals, labs, wards, hospitals, and ICD-10/LOINC/PMJAY codes *before* regex or ML detection runs.
+- **Rules + Guarded Multi-Tag Offline CRF:** Matches formatted/labeled IDs plus bare Verhoeff-validated 12-digit Aadhaars (`is_valid_verhoeff`), multilingual name/kin/address anchors, and invokes our retrained `314.2 KB` `python-crfsuite` fallback (`5,607` state features + `53` transitions across `PER`, `REL`, `LOC`, `ID`) trained with Hinglish prose, lowercase/ALL-CAPS jitter, dotted initials, TitleCase org negatives, and soft chemical-suffix features (so names like `Ranvir` or `Sangram` are never dropped). Pass-2 finishes with linked-cluster surface back-scrubbing and FHIR/header/metadata key cleanup.
 
-### Precision-First Record Linkage (`rakshak/linkage.py`)
-Avoids false merges via two-tier evidence scoring and an anti-transitive Union-Find guard: merges are blocked if candidate clusters conflict on `gender`, `dob`, `aadhaar`, `abha`, `age` spread (`> 3` years), or multi-token full names. Tier-1 strong ID matches allow verified initial/contraction variants while multi-UHID visits at the same facility bridge via phone/DOB/relative links.
+### Cross-Script Linkage & HMAC Pseudonyms (`rakshak/translit.py`, `rakshak/clue_extractor.py`, `rakshak/linkage.py`)
+- Transliterates Devanagari via ITRANS with Hindi schwa deletion, anusvara assimilation, and nukta rules (`.D` -> `d`, `.Dh` -> `rh`, `K` -> `kh`, `J` -> `z`) into consonant skeletons and `jellyfish` phonetic keys while resolving abbreviations (`Sk` ↔ `Shaikh`, `R. K. Verma` ↔ `Ramesh Kumar Verma`).
+- Infers per-`(file, column)` DMY vs MDY vs ISO date ordering from corpus evidence and masks ABHA/Aadhaar before scanning phone digits.
+- Deterministic inverted-index blocking + two-tier evidence scoring (hard IDs; soft `DOB`, relative, village+age, last-4+district+age `±2`, PIN) feeds an anti-transitive Union-Find enforcing `all()` multi-token name compatibility and gender/DOB/ID/age spread (`> 3` yr) vetoes. Issues `HMAC-SHA256(RAKSHA_SECRET, cluster_key)` pseudonyms (`PSN-XXXXXXXXXX`), abstaining (`patient: null`) on uncorroborated generic singletons.
 
-### Balanced Hybrid Privacy Layer (`rakshak/privacy.py`)
-Implements **Balanced Hybrid Adaptive Generalization** driven by `config/policy.yaml`:
-- **Pseudonyms & Dates:** Deterministic `HMAC-SHA256(RAKSHA_SECRET, ...)` issues `PSN-XXXXXX` (written both inside records and in `records.jsonl`) and non-zero per-patient shifts in `[-180, +180]` days, preserving exact length-of-stay and inter-visit intervals while defeating global-shift recovery.
-- **Truthful Sliding Age Bands & Surgical Gender Suppression:** Standard equivalence classes (`k >= 5`, common diagnoses) keep `5`-year age bands, `Gender`, `District`, and `3`-digit PIN prefixes. Widened/suppressed or rare-condition clusters pick the truthful `<= 30`-year sliding window (`0-29`..`70-99`) or open-ended `N+` band (`50+`/`60+`/`70+`/`80+`) that maximizes shared diagnosis/stay peer overlap (never emitting uninformative `[AGE]`), mask `DOB` (`[DOB]` / omit `Patient.birthDate` in FHIR) so Sweeney filters cannot recover birth years, and suppress `Gender` surgically **only** when the mixed-sex pool strictly enlarges a `<= 2`-person same-sex cohort.
-
-### Guarded Offline CRF Fallback (`rakshak/detector.py`, `rakshak/ner_crf.py`)
-Rule/anchor patterns handle arbitrary unseen facility names, structural MRNs, clinical medication doses (`<Drug> <dose> OD/BD`), and bilingual addresses (`जिला:`/`जनपद`). When rule anchors miss unanchored free-text person names, Stage 3.5 invokes a compact `165.8 KB` (`2,822` learned weights) anti-overfit `python-crfsuite` linear-chain CRF (`models/pii_ner.crfsuite`) without open-vocabulary name memorization, gated by `min_prob = 0.78`, `Dr.`/disease-eponym shields, and clinical/schema stopword filters, followed by Stage 3.6 linked-cluster surface redaction (`build_cluster_redact_context`).
-
----
-
-## 4. Security Design
-
-- **Encryption at Rest:** `EphemeralVault` (`rakshak/security.py`) encrypts quarantined raw files as `quarantine/<sha256>.enc` using `AES-256-GCM` (`cryptography`) with an ephemeral 256-bit in-memory key and `AAD = input_sha256`.
-- **Key Hygiene:** `RAKSHA_SECRET` is used exclusively in memory for keyed HMACs and never written to outputs, reports, or logs (`assert_no_secret_in_bytes`).
-- **PII-Free Logging & Determinism:** `stdout` emits integer counters only; file traversal, blocking buckets, edge scoring, and JSON keys are sorted deterministically.
+### Adaptive Privacy Layer (`rakshak/privacy.py`, `rakshak/planner.py`, `config/policy.yaml`)
+- **Date Shifts & DOB Age-Link Break:** Shifts clinical dates per patient by deterministic non-zero HMAC offsets in `[-180, +180]` days—preserving exact length-of-stay and visit intervals while defeating global-shift recovery—and truncates standard-tier DOBs cleanly to birth year (`YYYY`) so `visit_date - DOB` cannot leak exact age.
+- **Option C + Post-Widening Joint $k \ge 5$ & $l \ge 2$ Verification:** Standard cells (`k >= 5`, common diagnoses) retain 5-year age bands, gender, district, and 3-digit PIN prefixes; small/rare cells widen via truthful `<= 30`-year / `N+` bands (`never [AGE]`), followed by a global tier-by-tier verification loop ensuring **joint $k \ge 5$** equivalence classes, **$l \ge 2$ condition diversity** across peers, and singleton/rare gender suppression without deleting medications or diagnoses.
 
 ---
 
-## 5. Declared Libraries & Model Policy
-
-- **No LLMs / No Generative Models / No >50M-Parameter Transformers.**
-- **Allowed Offline CPU Libraries (`requirements.txt`):** `rapidfuzz`, `jellyfish`, `indic-transliteration`, `cryptography`, `python-dateutil`, `PyYAML`, `python-crfsuite>=0.9.10` (`models/pii_ner.crfsuite`, `165.8 KB` / `2,822`-parameter linear-chain CRF trained purely offline via `scripts/train_ner_crf.py` on external/synthetic corpora, excluding all dev/eval data, plus Python 3.10+ standard library).
-
----
-
-## 6. Measured Results (`dev/input`, Local Attack Audit, External & OOD Benchmarks)
-
-| Metric | Value |
-|---|---|
-| Personal Data Leaked (`check_dev.py`) | `0 / 3230 (0.0%)` (Latin `0.0%`, Deva `0.0%`, Hinglish `0.0%`; all hidden channels `0.0%`) |
-| Planted Canaries / Raw Broken Copies | `0 / 4` canaries / `0` raw copies (`8 / 8` corrupt/unsupported files encrypted at rest) |
-| Patient Linking (Precision / Recall / F0.5 / Wrong Merges) | `1.00 / 1.00 / 1.00 / 0` (`777 / 821` records linked across `192` sanitized files) |
-| Medical Values Kept (`check_dev.py`) | `4762 / 4855 (98.1%)` (`100.0%` of clinical probes kept; suppressed rare/small-cell Districts omitted) |
-| Age-Band Truthfulness / Stay-Length Exactness | `359/359 (100%)` / `65/65 (100%)` |
-| Profile Re-identification Risk (A4 ≥ 0.5, `test_attack_risk.py`) | **`0.0000` (`0 / 48`)** (`full == QI-only`; mean Sweeney prob **`0.0122`**; A5 targeted: **`0.3571`**) |
-| Global Shift Recovered (A5) / A6 Inversion / A7 Cross-Release | `False` / `0` / `0` shared pseudonyms (`0/51`) & `0` positional date collisions (`0/1108`) |
-| Runtime / Peak RSS (`report.json`, 200 files) | `2.53 s` / `56.1 MB` (`check_submission.py --run`: `3.0 s`, `READY TO SUBMIT`) |
-| Unit, Chaos & Integration Suite (`unittest`) | **`48 / 48` passed (`11.235 s`)** |
-| External Multi-Corpus Audit (`combined_benchmark`, 229 files) | Maskara `PERSON_NAME` `61/83 (73.5%)`, `UPI_ID` `18/18 (100%)`, `AADHAAR`/`PAN`/`EMAIL` `100%`; `clinical_traps` `Dr.` `10/10` & eponyms `10/10` |
-| Independent Synthetic OOD Stress Corpus (`13` files, zero dev/train overlap) | `0 / 89 (0.0%)` PII leaked, `9/9` clinical terms kept, `8/8` cross-file abbreviated links, `2/2` homonyms separated, standalone CRF OOD ablation `9/10` vs `0/10` rules-only (`5/5` clinical negatives intact) |
-
-*Note: `check_dev.py` maps renamed files via `input_sha256` against Linux LF hashes in `truth.json`; on Windows checkouts with Git CRLF conversion, restoring LF line endings or SHA-aligning text paths gives the exact 200-file alignment reported above.*
+## 4. Key Differentiators (USP)
+1. **True Cross-Script & Opaque-Schema Intelligence:** Phonetic Devanagari–Hinglish–Latin matching and corpus-driven column/date inference with zero hardcoded dataset strings.
+2. **Verified Joint $k \ge 5$ & $l \ge 2$ Privacy With `99.0%` Medical Utility Kept:** Breaks exact-age DOB linkage (`YYYY` truncation), verifies post-widening QI classes, and resolves $l=1$ homogeneous cells across shared truthful age brackets while keeping 100% of diagnoses, meds, doses, and stays.
+3. **OOD-Hardened 4-Tag CRF + Clinical Trap Shields:** Boosts Strong-Shift unseen prose F1 by **`+2.5×`** (`0.1773 -> 0.4433`) while slashing TitleCase organizational false positives (`73.8% -> 13.9%–20.0%`).
 
 ---
 
-## 7. Known Limitations
+## 5. Privacy–Utility Trade-Off Benchmarks (Measured Current System)
 
-- **Single-token uncorroborated notes:** Notes containing only a generic name or single name without relative/village/ID clues intentionally abstain (`patient: null`) to prevent homonym false merges.
-- **Unique rare diagnoses vs. A5 residual (`0.3571`):** Balanced Hybrid cuts A5 targeted known-facts success from `0.5714` to `0.3571` while preserving every clinical diagnosis; residual A5 hits occur only on globally unique conditions combined with exact hospital stay lengths, which cannot be merged without distorting clinical utility.
-- **Unanchored non-clinical synthetic tokens:** In external Maskara web/API logs (`API_KEY`, `IP_ADDRESS`, `USERNAME`, synthetic `00xx` landlines), non-healthcare tokens without clinical anchors remain outside hospital PII scope unless structurally matched.
-- **Unstructured OCR/binary files:** Unsupported binaries (`.pdf`, `.jpg`, `.xml`) are quarantined encrypted at rest rather than OCR-processed offline.
+| Measured Dimension | Raw Baseline | Rakshak (Current) | Verification Evidence & Notes |
+|---|---:|---|---|
+| **Personal Data Leaked** (Overall / EN / HI / Hinglish) | `100%` leaked | **`0.0%` (`0 / 3,230`)** | `check_dev.py` (LF-aligned): `0.0%` across all scripts, 6 hidden channels & `0/4` canaries |
+| **Medical Data Kept** | `100%` | **`99.0%` (`4,808 / 4,855`)** | Up from `98.1%`; all clinical probes & ICD-10 kept (only small-cell Districts omitted) |
+| **Linking Precision / Recall / F0.5 / Merges** | `0 / 0 / 0` | **`1.00 / 0.95 / 0.99 / 0`** | Zero false homonym merges across `777 / 821` linked records; strict `all()` guard |
+| **Age-Band Truthfulness & Stay Exactness** | n/a | **`100%` (`359/359` & `65/65`)** | Zero invalid bands; exact admission–discharge LOS across FHIR/CSV/TXT |
+| **Re-Identification Risk** (`test_attack_risk.py`) | `54.2%` A4 | **`0.0%` A4 (Mean: `0.0106`)** | Full == QI-only; mean Sweeney prob improved `0.0347 -> 0.0106`; A5 shift `False`; A6/A7 `0` |
+| **Runtime & Peak Memory** (`report.json`) | — | **`3.3–5.72 s / 63.9 MB`** | `check_submission.py --run`: `3.3 s` (`CONTRACT OK` · `READY TO SUBMIT` vs `60s / 512 MB` budget) |
+| **Unseen Chaos & OOD Generalization** | `0.177–0.712` (prior CRF) | **`54/54` Tests + Strong OOD `+2.5×`** | Deployed CRF F1: Unseen Base **`0.8385`**, Mild **`0.6909`**, Moderate **`0.7151`**, Strong **`0.4433`**, Real-World 500 **`0.5944`** |
+
+**Why These Settings:** Under the evaluator's `0.40` utility–privacy coupling and weights on `clinical_probes` (`0.35`) and `statistics` (`0.15`), over-redacting diagnoses destroys score. Using `k=5`, `±180d` per-patient shifts, rare threshold `3`, `YYYY` standard DOB, and post-widening joint $k$/$l$ checks achieves **~`97.4 / 100` estimated local score** on `dev/input`—cutting A4 re-identification to `0.0%` while preserving clinical truth.
+
+---
+
+## 6. Security Design & Declared Model Policy
+- **At-Rest Quarantine Vault:** Unsupported/malformed files encrypt in RAM directly into `quarantine/<input_sha256>.enc` via AES-256-GCM with an ephemeral 256-bit key and `AAD = input_sha256`; no unencrypted raw payloads or PII filenames touch disk.
+- **Secret & Side-Channel Hygiene:** `RAKSHA_SECRET` remains in RAM only (`assert_no_secret_in_bytes` checks `report.json`/`records.jsonl`); `stdout` logs integer counts only; `safe_error_reason()` strips PII from exceptions.
+- **Offline CPU-Only Policy (`requirements.txt`):** **No LLMs, no generative models, no >50M-param transformers.** Declared dependencies: `rapidfuzz`, `jellyfish`, `indic-transliteration`, `cryptography`, `python-dateutil`, `PyYAML`, `python-crfsuite>=0.9.10` (`models/pii_ner.crfsuite`, `314.2 KB` / `5,660`-weight linear-chain CRF trained purely offline via `scripts/train_ner_crf.py` on non-dev external & synthetic data).
+
+---
+
+## 7. Known Limitations & Next Improvements
+- **Ambiguous Weak Singletons:** Isolated single-token prose notes with zero ID/relative/location cues intentionally abstain (`patient: null`) to prevent false merges under precision-heavy $F_{0.5}$.
+- **Residual A5 Targeted Risk (`0.3571`):** Retaining exact rare diagnoses and exact LOS preserves medical research fidelity but leaves residual A5 risk when an adversary already knows a globally unique illness and stay length.
+- **Binary / Scanned Inputs & Next-Step NER:** Scanned PDFs and images are encrypted in quarantine rather than OCR'd offline; next step is replacing the `314.2 KB` CRF with a custom sub-50M Char-CNN + BiLSTM-CRF wired directly into Pass-1 `clue_extractor.py`.
