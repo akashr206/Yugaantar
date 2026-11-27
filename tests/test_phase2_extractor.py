@@ -104,7 +104,6 @@ class TestPhase2Extractor(unittest.TestCase):
         self.assertIn("kgmu26009912", clue.mrns)
         self.assertIn("sgpgi882210", clue.mrns)
 
-<<<<<<< Updated upstream
     def test_unseen_facility_pooled_mdy_inference_without_hardcoding(self) -> None:
         units = [
             RecordUnit(
@@ -129,7 +128,7 @@ class TestPhase2Extractor(unittest.TestCase):
         self.assertEqual(orders[("notes/mercy_02.txt", "__doc__")], "mdy")
         clues = extract_all_clues(units)
         self.assertEqual([d.iso_date for d in clues[1].dates], ["2026-02-01", "2026-02-06"])
-=======
+
     def test_timestamped_nursing_note_extraction_and_non_name_guard(self) -> None:
         u = RecordUnit(
             unit_id="notes/n_ts.txt::doc",
@@ -145,7 +144,41 @@ class TestPhase2Extractor(unittest.TestCase):
         clue = extract_all_clues([u])[0]
         self.assertEqual([n.latin_tokens for n in clue.patient_names], [("mohammad", "arif")])
         self.assertEqual([r.latin_tokens for r in clue.relative_names], [("abdul", "karim")])
->>>>>>> Stashed changes
+
+    def test_unified_key_classifier_and_unseen_formats(self) -> None:
+        from rakshak.schema_profiler import is_clean_reference_file
+
+        u = RecordUnit(
+            unit_id="claims/unseen.json::/records/0",
+            file_rel="claims/unseen.json",
+            loc="/records/0",
+            format_type="json",
+            structured_fields={
+                "ipd_no": "KGMU/26/00123",
+                "member_id": "CGHS-99881",
+                "beneficiary_name": "Karan Malhotra",
+                "kin": {"name": "Sunita Malhotra"},
+                "tehsil": "Bikapur",
+                "abha": "23-4455-6677-8899",
+                "dob": "15/06/12",
+                "visit_date": "September 5, 2026",
+                "sex": "Female",
+            },
+        )
+        clue = extract_all_clues([u])[0]
+        self.assertEqual(clue.abhas, ("23445566778899",))
+        self.assertIn("kgmu2600123", clue.mrns)
+        self.assertIn("CGHS-99881", clue.insurance_ids)
+        self.assertEqual([n.latin_tokens for n in clue.patient_names], [("karan", "malhotra")])
+        self.assertEqual([r.latin_tokens for r in clue.relative_names], [("sunita", "malhotra")])
+        self.assertEqual(clue.dob, "2012-06-15")
+        self.assertEqual(clue.gender, "F")
+        self.assertIn("2026-09-05", [d.iso_date for d in clue.dates])
+
+        # Decoy clean/ file with patient anchor or MRN must NOT be treated as clean reference
+        self.assertFalse(
+            is_clean_reference_file("clean/decoy_protocol.txt", "txt", "", "Patient Name: Karan Malhotra\nMRN: KGMU/26/00123\n")
+        )
 
 
 if __name__ == "__main__":

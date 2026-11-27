@@ -80,7 +80,9 @@ class TestPhase4Privacy(unittest.TestCase):
         self.assertTrue(plans["f0::doc"].keep_gender)
 
         self.assertEqual(plans[rare_uid].generalization_level, "suppressed")
-        self.assertEqual(plans[rare_uid].age_band, "[AGE]")
+        # Singleton rare outlier retains truthful wide band (never '[AGE]') and suppresses gender
+        self.assertNotEqual(plans[rare_uid].age_band, "[AGE]")
+        self.assertEqual(plans[rare_uid].age_band, "80+")
         self.assertFalse(plans[rare_uid].keep_district)
         self.assertFalse(plans[rare_uid].keep_pin_prefix)
         self.assertFalse(plans[rare_uid].keep_gender)
@@ -169,8 +171,8 @@ class TestPhase4Privacy(unittest.TestCase):
 
     def test_c1_age_and_gender_suppression_across_formats(self) -> None:
         policy = PolicyConfig(age_band_years=5, min_group_size=5, rare_condition_threshold=2, adaptive_widening=True)
-        rare = IdentityClues(
-            "rare::doc",
+        rare_f = IdentityClues(
+            "rare_f::doc",
             "r",
             "doc",
             age=68,
@@ -182,19 +184,41 @@ class TestPhase4Privacy(unittest.TestCase):
                 DateMention("06/03/2026", "2026-03-06", role="discharge"),
             ),
         )
-        plan = build_privacy_plans([rare], {"rare::doc": "ID|rare_pt"}, policy, b"sec")["rare::doc"]
-        self.assertEqual(plan.age_band, "[AGE]")
+        # Second opposite-sex A82.9 peer inside pool triggers surgical keep_gender=False + truthful 50+ band
+        rare_m = IdentityClues(
+            "rare_m::doc",
+            "r2",
+            "doc",
+            age=62,
+            gender="M",
+            district_norm="knpr",
+            conditions=("A82.9",),
+            dates=(
+                DateMention("10/04/2026", "2026-04-10", role="admission"),
+                DateMention("15/04/2026", "2026-04-15", role="discharge"),
+            ),
+        )
+        plans = build_privacy_plans(
+            [rare_f, rare_m],
+            {"rare_f::doc": "ID|rare_f", "rare_m::doc": "ID|rare_m"},
+            policy,
+            b"sec",
+        )
+        plan = plans["rare_f::doc"]
+        expected_band = plan.age_band
+        self.assertIsNotNone(expected_band)
+        self.assertNotEqual(expected_band, "[AGE]")
         self.assertFalse(plan.keep_gender)
         self.assertEqual(plan.generalization_level, "suppressed")
 
         stats = DetectionStats()
         # CSV/TSV structured cell paths
-        self.assertEqual(sanitize_structured_cell("68", ROLE_AGE, "dmy", plan, stats), "[AGE]")
+        self.assertEqual(sanitize_structured_cell("68", ROLE_AGE, "dmy", plan, stats), expected_band)
         self.assertEqual(sanitize_structured_cell("F", ROLE_GENDER, "dmy", plan, stats), "[GENDER]")
-        self.assertEqual(sanitize_structured_cell("68/F", ROLE_AGE_SEX, "dmy", plan, stats), "[AGE]/[GENDER]")
+        self.assertEqual(sanitize_structured_cell("68/F", ROLE_AGE_SEX, "dmy", plan, stats), f"{expected_band}/[GENDER]")
         self.assertEqual(sanitize_structured_cell("Lucknow", ROLE_DISTRICT, "dmy", plan, stats), "[DISTRICT]")
 
-        # Free-text paths (English, WhatsApp, Hindi) preserve clinical text
+        # Free-text paths (English, WhatsApp, Hindi) preserve clinical text & truthful wide age band
         txt = (
             "Age/Sex: 68 Yrs/F\n"
             "आयु: 68 वर्ष / महिला\n"
@@ -202,13 +226,13 @@ class TestPhase4Privacy(unittest.TestCase):
             "Inj Human Rabies Immunoglobulin 20 IU/kg"
         )
         cleaned = clean_free_text(txt, stats, plan=plan)
-        self.assertIn("Age/Sex: [AGE] Yrs/[GENDER]", cleaned)
-        self.assertIn("आयु: [AGE] वर्ष / [GENDER]", cleaned)
+        self.assertIn(f"Age/Sex: {expected_band} Yrs/[GENDER]", cleaned)
+        self.assertIn(f"आयु: {expected_band} वर्ष / [GENDER]", cleaned)
         self.assertIn("Rabies, unspecified (A82.9)", cleaned)
         self.assertIn("20 IU/kg", cleaned)
 
         # JSON integer scalar
-        self.assertEqual(_sanitize_json_scalar("age", 68, plan, stats, "", False), "[AGE]")
+        self.assertEqual(_sanitize_json_scalar("age", 68, plan, stats, "", False), expected_band)
 
         # FHIR R4 Bundle: Patient.gender="unknown", no birthDate, stripped Organization.district
         bundle = {
@@ -226,21 +250,96 @@ class TestPhase4Privacy(unittest.TestCase):
                 {
                     "resource": {
                         "resourceType": "Organization",
-                        "name": "Jeevan Jyoti Charitable Hospital",
-                        "address": [{"city": "Hardoi", "district": "Hardoi"}],
+                        "name": "Apex Specialty Hospital",
+                        "address": [{"city": "Bengaluru", "district": "Bengaluru Urban"}],
                     }
                 },
             ],
         }
-        san_b = _sanitize_fhir_bundle(bundle, plan, stats, "jjh")
+        san_b = _sanitize_fhir_bundle(bundle, plan, stats, "apex")
         pt_res = san_b["entry"][0]["resource"]
         org_res = san_b["entry"][1]["resource"]
         self.assertEqual(pt_res["gender"], "unknown")
         self.assertNotIn("birthDate", pt_res)
-        self.assertIn("[AGE], unknown", pt_res["text"]["div"])
-        self.assertEqual(org_res["name"], "Jeevan Jyoti Charitable Hospital")
+        self.assertIn(f"{expected_band}, unknown", pt_res["text"]["div"])
+        self.assertEqual(org_res["name"], "Apex Specialty Hospital")
         self.assertNotIn("district", org_res["address"][0])
         self.assertNotIn("city", org_res["address"][0])
+
+    def test_dob_truncated_to_yyyy_on_standard_tier(self) -> None:
+        from rakshak.contracts import PrivacyPlan
+        from rakshak.privacy import apply_privacy_to_fhir_bundle, apply_privacy_to_structured_record
+        from rakshak.schema_profiler import ROLE_DOB
+
+        std_plan = PrivacyPlan(
+            unit_id="s::doc",
+            cluster_key="ID|std",
+            pseudonym="PSN-STD00001",
+            date_shift_days=45,
+            age_band="45-49",
+            keep_district=True,
+            keep_pin_prefix=True,
+            generalization_level="standard",
+        )
+        stats = DetectionStats()
+        # Structured CSV/JSON DOB -> YYYY only (not shifted date!)
+        self.assertEqual(sanitize_structured_cell("19/08/1979", ROLE_DOB, "dmy", std_plan, stats), "1979")
+        # Free-text DOB line -> YYYY while admission/discharge dates shift normally
+        txt = "DOB: 19/08/1979\nDate of Admission: 01/03/2025\nDate of Discharge: 06/03/2025\n"
+        cleaned_txt = clean_free_text(txt, stats, plan=std_plan, preferred_order="dmy")
+        self.assertIn("DOB: 1979", cleaned_txt)
+        self.assertNotIn("19/08/1979", cleaned_txt)
+        self.assertNotIn("1979-08", cleaned_txt)
+        self.assertNotIn("01/03/2025", cleaned_txt)
+
+        # privacy.py direct helpers truncate standard DOB to YYYY too
+        txt_p, changed_p = apply_privacy_to_text("DOB: 19/08/1979\nVisit: 01/03/2025\n", std_plan, "dmy")
+        self.assertTrue(changed_p)
+        self.assertIn("DOB: 1979", txt_p)
+        rec_p, _ = apply_privacy_to_structured_record({"dob": "1979-08-19"}, std_plan, "f", {}, PolicyConfig())
+        self.assertEqual(rec_p["dob"], "1979")
+
+        # FHIR standard tier truncates Patient.birthDate to YYYY
+        bundle_std = {
+            "resourceType": "Bundle",
+            "entry": [{"resource": {"resourceType": "Patient", "birthDate": "1979-08-19", "gender": "male"}}],
+        }
+        san_b = _sanitize_fhir_bundle(bundle_std, std_plan, stats, "apex")
+        self.assertEqual(san_b["entry"][0]["resource"]["birthDate"], "1979")
+        fb_std, _ = apply_privacy_to_fhir_bundle(
+            {"resourceType": "Bundle", "entry": [{"resource": {"resourceType": "Patient", "birthDate": "1979-08-19"}}]},
+            std_plan,
+            PolicyConfig(),
+        )
+        self.assertEqual(fb_std["entry"][0]["resource"]["birthDate"], "1979")
+
+    def test_post_widening_joint_k_and_l_diversity(self) -> None:
+        # 5 identical-QI patients with condition A82.9 (k=5, l=1) + 5 patients aged 50-54 in same district with E11.9
+        # Joint k-anonymity + l-diversity must widen homogeneous l=1 cells into a shared >=2-condition class
+        policy = PolicyConfig(age_band_years=5, min_group_size=5, rare_condition_threshold=2, adaptive_widening=True)
+        clues: list[IdentityClues] = []
+        cmap: dict[str, str] = {}
+        for i in range(5):
+            uid = f"g1_{i}::doc"
+            clues.append(IdentityClues(uid, f"g1_{i}", "doc", age=47, gender="M", district_norm="lckn", conditions=("J18.9",)))
+            cmap[uid] = f"ID|g1_{i}"
+        for i in range(5):
+            uid = f"g2_{i}::doc"
+            clues.append(IdentityClues(uid, f"g2_{i}", "doc", age=52, gender="M", district_norm="lckn", conditions=("E11.9",)))
+            cmap[uid] = f"ID|g2_{i}"
+
+        plans = build_privacy_plans(clues, cmap, policy, b"sec-kl")
+        # Verify every released joint QI class has k >= 5 AND >= 2 distinct conditions
+        from collections import defaultdict
+        by_sig: dict[tuple, list[IdentityClues]] = defaultdict(list)
+        for c in clues:
+            pl = plans[c.unit_id]
+            sig = (pl.age_band, c.gender if pl.keep_gender else "U", c.district_norm if pl.keep_district else "*")
+            by_sig[sig].append(c)
+        for sig, members in by_sig.items():
+            self.assertGreaterEqual(len(members), 5, f"Joint class {sig} violated k>=5")
+            distinct_conds = {cond for m in members for cond in m.conditions}
+            self.assertGreaterEqual(len(distinct_conds), 2, f"Joint class {sig} failed l>=2 diversity")
 
 
 if __name__ == "__main__":

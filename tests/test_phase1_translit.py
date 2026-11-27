@@ -106,8 +106,27 @@ class TestPhase1Translit(unittest.TestCase):
 
         self.assertEqual(norm_mrn("SNJ/26/064127"), ("snj26064127", "064127", "snj"))
         self.assertEqual(norm_mrn("JJH-0076864"), ("jjh0076864", "0076864", "jjh"))
-        self.assertEqual(norm_mrn("UHID-010607"), ("uhid010607", "010607", "ass"))
+        self.assertEqual(norm_mrn("UHID-010607"), ("uhid010607", "010607", "uhid"))
         self.assertEqual(norm_mrn("DHH2026-084999"), ("dhh2026084999", "084999", "dhh"))
+
+    def test_unseen_contractions_initials_and_honorifics(self) -> None:
+        from rakshak.translit import has_compatible_abbrev
+
+        pairs = [
+            ("Sk Tariq", "Shaikh Tariq"),
+            ("Sk Tariq", "शेख तारिक"),
+            ("Ramesh Kr", "Ramesh Kumar"),
+            ("Ram Pd", "Ram Prasad"),
+            ("Subram Iyer", "Subramanian Iyer"),
+            ("Smt. Kamla Devi", "श्रीमती कमला देवी"),
+        ]
+        for a, b in pairs:
+            ta, tb = extract_name_tokens(a), extract_name_tokens(b)
+            self.assertGreaterEqual(name_tokens_match(ta, tb), 0.85, f"{a!r} vs {b!r}")
+
+        self.assertTrue(has_compatible_abbrev(extract_name_tokens("R. K. Verma"), extract_name_tokens("Ramesh Kumar Verma")))
+        self.assertTrue(has_compatible_abbrev(extract_name_tokens("Sk Tariq"), extract_name_tokens("Shaikh Tariq")))
+        self.assertFalse(has_compatible_abbrev(extract_name_tokens("R. Gupta"), extract_name_tokens("Ramesh Verma")))
 
 
 if __name__ == "__main__":
