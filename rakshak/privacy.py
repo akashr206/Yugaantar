@@ -23,21 +23,44 @@ _ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32: no I, L, O, 
 
 _ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})(T[^\s\"']*)?\b")
 _SLASH_DATE_RE = re.compile(r"\b(\d{1,2})([/.-])(\d{1,2})\2(\d{2}|\d{4})\b")
+_MONTH_TOKEN_ALT = (
+    r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|"
+    r"जनवरी|फरवरी|मार्च|अप्रैल|मई|जून|जुलाई|अगस्त|सितंबर|सितम्बर|अक्टूबर|अक्तूबर|नवंबर|नवम्बर|दिसंबर|दिसम्बर"
+)
 _TEXT_MONTH_DATE_RE = re.compile(
-    r"\b(\d{1,2})\s+(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
-    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
-    r"(?:\s+(\d{4}))?\b",
+    rf"(?<!\d)(\d{{1,2}})(?:st|nd|rd|th)?([\s/-]+)({_MONTH_TOKEN_ALT})(?:(?:,?\s+|\2)(\d{{2,4}}))?(?!\d)",
+    re.I,
+)
+_US_TEXT_MONTH_DATE_RE = re.compile(
+    rf"\b({_MONTH_TOKEN_ALT})([\s,/-]+)(\d{{1,2}})(?:st|nd|rd|th)?(?:(?:,?\s+|[\s/-]+)(\d{{2,4}}))?(?!\d)(?!\s*(?:mg|mcg|gm?|ml|iu|/ul|mmhg|yrs?|years?|days?|wks?|weeks?|months?|hrs?|%)\b)",
+    re.I,
+)
+_YMD_TEXT_MONTH_DATE_RE = re.compile(
+    rf"(?<!\d)(\d{{4}})([\s/-]+)({_MONTH_TOKEN_ALT})\2(\d{{1,2}})(?:st|nd|rd|th)?(?!\d)",
     re.I,
 )
 _MONTH_MAP = {
-    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
-    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
-    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
-    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+    "jan": 1, "january": 1, "जनवरी": 1,
+    "feb": 2, "february": 2, "फरवरी": 2,
+    "mar": 3, "march": 3, "मार्च": 3,
+    "apr": 4, "april": 4, "अप्रैल": 4,
+    "may": 5, "मई": 5,
+    "jun": 6, "june": 6, "जून": 6,
+    "jul": 7, "july": 7, "जुलाई": 7,
+    "aug": 8, "august": 8, "अगस्त": 8,
+    "sep": 9, "sept": 9, "september": 9, "सितंबर": 9, "सितम्बर": 9,
+    "oct": 10, "october": 10, "अक्टूबर": 10, "अक्तूबर": 10,
+    "nov": 11, "november": 11, "नवंबर": 11, "नवम्बर": 11,
+    "dec": 12, "december": 12, "दिसंबर": 12, "दिसम्बर": 12,
 }
 _MONTH_NAMES = [
     "", "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
+]
+_MONTH_NAMES_SHORT = [
+    "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ]
 
 # Free-text age forms matching attacker's parser (never match lab ranges, history durations, or already-banded "35-39" / "85+")
@@ -110,22 +133,112 @@ def shift_date_token(raw_date: str, shift_days: int, order: str = "dmy") -> str:
                 rep = f"{shifted.day:02d}{sep}{shifted.month:02d}{sep}{yy}"
             return s[:m_sl.start()] + rep + s[m_sl.end():]
 
+    def _expand_yr(y_str: str) -> int:
+        yi = int(y_str)
+        if len(y_str) >= 4:
+            return yi
+        return 2000 + yi if yi <= 35 else 1900 + yi
+
+    def _fmt_month(mo_num: int, orig_tok: str) -> str:
+        if orig_tok.isascii() and len(orig_tok) <= 4:
+            return _MONTH_NAMES_SHORT[mo_num]
+        return _MONTH_NAMES[mo_num]
+
+    def _fmt_year(y_val: int, orig_yr: str) -> str:
+        return f"{y_val % 100:02d}" if len(orig_yr) == 2 else f"{y_val:04d}"
+
+    m_ymdt = _YMD_TEXT_MONTH_DATE_RE.search(s)
+    if m_ymdt:
+        y = int(m_ymdt.group(1))
+        sep = m_ymdt.group(2)
+        mo_tok = m_ymdt.group(3)
+        mo = _MONTH_MAP.get(mo_tok.lower())
+        d = int(m_ymdt.group(4))
+        if mo:
+            try:
+                shifted = dt.date(y, mo, d) + dt.timedelta(days=shift_days)
+                rep = f"{shifted.year:04d}{sep}{_fmt_month(shifted.month, mo_tok)}{sep}{shifted.day:02d}"
+                return s[:m_ymdt.start()] + rep + s[m_ymdt.end():]
+            except ValueError:
+                return raw_date
+
     m_txt = _TEXT_MONTH_DATE_RE.search(s)
     if m_txt:
         d = int(m_txt.group(1))
-        mo = _MONTH_MAP[m_txt.group(2).lower()]
-        y = int(m_txt.group(3)) if m_txt.group(3) else 2026
-        try:
-            shifted = dt.date(y, mo, d) + dt.timedelta(days=shift_days)
-            if m_txt.group(3):
-                rep = f"{shifted.day} {_MONTH_NAMES[shifted.month]} {shifted.year}"
-            else:
-                rep = f"{shifted.day} {_MONTH_NAMES[shifted.month]}"
-            return s[:m_txt.start()] + rep + s[m_txt.end():]
-        except ValueError:
+        sep = m_txt.group(2)
+        mo_tok = m_txt.group(3)
+        yr_tok = m_txt.group(4)
+        if not yr_tok and mo_tok == "may":
             return raw_date
+        mo = _MONTH_MAP.get(mo_tok.lower())
+        y = _expand_yr(yr_tok) if yr_tok else 2026
+        if mo:
+            try:
+                shifted = dt.date(y, mo, d) + dt.timedelta(days=shift_days)
+                out_sep = sep if sep in ("-", "/") else " "
+                m_str = _fmt_month(shifted.month, mo_tok)
+                if yr_tok:
+                    y_str = _fmt_year(shifted.year, yr_tok)
+                    rep = f"{shifted.day:02d}{out_sep}{m_str}{out_sep}{y_str}" if out_sep in ("-", "/") else f"{shifted.day} {m_str} {y_str}"
+                else:
+                    rep = f"{shifted.day}{out_sep}{m_str}"
+                return s[:m_txt.start()] + rep + s[m_txt.end():]
+            except ValueError:
+                return raw_date
+
+    m_us = _US_TEXT_MONTH_DATE_RE.search(s)
+    if m_us:
+        mo_tok = m_us.group(1)
+        sep = m_us.group(2)
+        d = int(m_us.group(3))
+        yr_tok = m_us.group(4)
+        if not yr_tok and mo_tok == "may":
+            return raw_date
+        mo = _MONTH_MAP.get(mo_tok.lower())
+        y = _expand_yr(yr_tok) if yr_tok else 2026
+        if mo:
+            try:
+                shifted = dt.date(y, mo, d) + dt.timedelta(days=shift_days)
+                m_str = _fmt_month(shifted.month, mo_tok)
+                if yr_tok:
+                    y_str = _fmt_year(shifted.year, yr_tok)
+                    if sep in ("-", "/"):
+                        rep = f"{m_str}{sep}{shifted.day:02d}{sep}{y_str}"
+                    else:
+                        rep = f"{m_str} {shifted.day}, {y_str}"
+                else:
+                    out_sep = sep if sep in ("-", "/") else " "
+                    rep = f"{m_str}{out_sep}{shifted.day}"
+                return s[:m_us.start()] + rep + s[m_us.end():]
+            except ValueError:
+                return raw_date
 
     return raw_date
+
+
+def _candidate_wide_bands(ages: list[int]) -> list[tuple[str, int, int]]:
+    """Return all truthful width<=30 or N+ bands covering every observed age in `ages`."""
+    lo_a = max(0, min(ages))
+    hi_a = min(120, max(ages))
+    candidates: list[tuple[str, int, int]] = []
+    for base in range(0, 80, 10):
+        b_lo, b_hi = base, base + 29
+        if b_lo <= lo_a and hi_a <= b_hi:
+            candidates.append((f"{b_lo}-{b_hi}", b_lo, b_hi))
+    for cap in (50, 60, 70, 80):
+        if lo_a >= cap:
+            candidates.append((f"{cap}+", cap, 120))
+    if not candidates:
+        fb = _hull_age_band(ages, 20, 80)
+        if fb.endswith("+"):
+            c = int(fb[:-1])
+            candidates.append((fb, c, 120))
+        elif "-" in fb:
+            a, b = (int(x) for x in fb.split("-"))
+            candidates.append((fb, a, b))
+        else:
+            candidates.append((f"{(lo_a // 10) * 10}+", (lo_a // 10) * 10, 120))
+    return candidates
 
 
 def _hull_age_band(ages: list[int], width: int, cap: int) -> str:
@@ -267,7 +380,8 @@ def build_privacy_plans(
             cluster_tier[ck] = (hull_b, True, True, "standard", True)
             continue
 
-        # Evaluate condition and stay cohort sizes within (20-yr band, gender) to guard targeted outliers
+        # Balanced Hybrid: pick the truthful width<=30 age band maximizing cohort overlap across
+        # matching diagnoses/stays (never '[AGE]'), and drop gender only when it merges >=1 opposite-sex match.
         band20_ck = format_age_band(age, 20, 80) if age is not None else "UNK"
         cond_cohort = min(
             (
@@ -302,18 +416,82 @@ def build_privacy_plans(
             or (cell_k < policy.min_group_size and is_elderly)
         )
 
+        # Select best truthful wide band covering ages_all maximizing shared-trait overlap
+        if ages_all:
+            cands = _candidate_wide_bands(ages_all)
+            best_label, best_lo, best_hi = cands[0]
+            best_score = (-1, -1, "")
+            for lbl, b_lo, b_hi in cands:
+                cond_peers = sum(
+                    1
+                    for ock in cluster_units
+                    if ock != ck
+                    and (profile_conds[ck] & profile_conds[ock])
+                    and profile_age[ock] is not None
+                    and b_lo <= profile_age[ock] <= b_hi
+                )
+                stay_peers = sum(
+                    1
+                    for ock in cluster_units
+                    if ock != ck
+                    and (profile_stays[ck] & profile_stays[ock])
+                    and profile_age[ock] is not None
+                    and b_lo <= profile_age[ock] <= b_hi
+                )
+                total_peers = sum(
+                    1
+                    for ock in cluster_units
+                    if profile_age[ock] is not None and b_lo <= profile_age[ock] <= b_hi
+                )
+                sc = (cond_peers * 4 + stay_peers * 2, total_peers, lbl)
+                if sc > best_score:
+                    best_score = sc
+                    best_label, best_lo, best_hi = lbl, b_lo, b_hi
+            band_pool_ck = best_label
+            pool_lo, pool_hi = best_lo, best_hi
+        else:
+            band_pool_ck = "UNK"
+            pool_lo, pool_hi = 0, 120
+
+        def _in_pool(ock: str) -> bool:
+            pa = profile_age[ock]
+            return pa is not None and pool_lo <= pa <= pool_hi
+
+        # Suppress gender when same-gender cohort is tiny (<=2) with opposite-sex peers, OR on singleton/rare outliers
+        gender_isolates_cond = any(
+            cond_patient_counts[cond] >= 2
+            and (
+                same_g := sum(1 for ock in cluster_units if _in_pool(ock) and cond in profile_conds[ock] and profile_gender[ock] == profile_gender[ck])
+            ) <= 2
+            and sum(1 for ock in cluster_units if _in_pool(ock) and cond in profile_conds[ock]) > same_g
+            for cond in profile_conds[ck]
+        )
+        gender_isolates_stay = any(
+            (
+                same_g := sum(1 for ock in cluster_units if _in_pool(ock) and st in profile_stays[ock] and profile_gender[ock] == profile_gender[ck])
+            ) <= 2
+            and sum(1 for ock in cluster_units if _in_pool(ock) and st in profile_stays[ock]) > same_g
+            for st in profile_stays[ck]
+        )
+        singleton_rare = (
+            has_rare
+            or (cell_k < policy.min_group_size and is_elderly)
+            or (cell_k <= 1 and vuln_targeted)
+        )
+        keep_gen = not (gender_isolates_cond or gender_isolates_stay or singleton_rare)
+
         if has_rare or (cell_k < policy.min_group_size and is_elderly):
-            wide_b = "[AGE]" if vuln_targeted else (_hull_age_band(ages_all, 20, 80) if ages_all else None)
-            cluster_tier[ck] = (wide_b, False, False, "suppressed", not vuln_targeted)
+            wide_b = band_pool_ck if (vuln_targeted and ages_all) else (_hull_age_band(ages_all, 20, 80) if ages_all else None)
+            cluster_tier[ck] = (wide_b, False, False, "suppressed", keep_gen)
         elif cell_k < policy.min_group_size or is_elderly:
             band10 = format_age_band(age, 10, 80) if age is not None else None
             k10 = wide10_cells[(band10 or "UNK", profile_gender[ck], profile_district[ck])]
             if k10 < policy.min_group_size:
-                wide_b = "[AGE]" if vuln_targeted else (_hull_age_band(ages_all, 20, 80) if ages_all else None)
-                cluster_tier[ck] = (wide_b, False, False, "suppressed", not vuln_targeted)
+                wide_b = band_pool_ck if (vuln_targeted and ages_all) else (_hull_age_band(ages_all, 20, 80) if ages_all else None)
+                cluster_tier[ck] = (wide_b, False, False, "suppressed", keep_gen)
             else:
-                hull10 = _hull_age_band(ages_all, 10, 80) if ages_all else band10
-                cluster_tier[ck] = (hull10, True, False, "widened", True)
+                hull10 = band_pool_ck if (vuln_targeted and ages_all) else (_hull_age_band(ages_all, 10, 80) if ages_all else band10)
+                cluster_tier[ck] = (hull10, True, False, "widened", keep_gen)
         else:
             pin_ok = (profile_pin_px[ck] == "U") or (
                 pin_cells[(std_band or "UNK", profile_gender[ck], profile_district[ck], profile_pin_px[ck])]
@@ -324,8 +502,127 @@ def build_privacy_plans(
                 >= policy.min_group_size
             )
             lvl = "standard" if byr_ok else "widened"
-            hull_s = _hull_age_band(ages_all, policy.age_band_years, policy.max_age_cap) if ages_all else std_band
-            cluster_tier[ck] = (hull_s, True, pin_ok, lvl, True)
+            hull_s = band_pool_ck if (vuln_targeted and ages_all) else (_hull_age_band(ages_all, policy.age_band_years, policy.max_age_cap) if ages_all else std_band)
+            cluster_tier[ck] = (hull_s, True, pin_ok, lvl, keep_gen)
+
+    # Post-widening joint k-anonymity & l-diversity verification across full released QIs
+    if policy.adaptive_widening and cluster_tier:
+        def _joint_sig(ck: str, tier: tuple[str | None, bool, bool, str, bool]) -> tuple[str, str, str, str, str]:
+            t_band, t_dist, t_pin, t_lvl, t_gen = tier
+            return (
+                t_band or "UNK",
+                profile_gender[ck] if t_gen else "U",
+                profile_district[ck] if t_dist else "*",
+                profile_pin_px[ck] if t_pin else "*",
+                profile_birth_yr[ck] if t_lvl == "standard" else "*",
+            )
+
+        def _widest_peer_band(ck: str) -> str | None:
+            ages_all_ck = [m.age for m in cluster_units[ck] if m.age is not None]
+            if not ages_all_ck:
+                return None
+            cands = _candidate_wide_bands(ages_all_ck)
+            best_lbl = cands[0][0]
+            best_sc = (-1, "")
+            for lbl, b_lo, b_hi in cands:
+                peers = sum(
+                    1
+                    for ock in cluster_units
+                    if profile_age[ock] is not None and b_lo <= profile_age[ock] <= b_hi
+                )
+                sc = (peers, lbl)
+                if sc > best_sc:
+                    best_sc = sc
+                    best_lbl = lbl
+            return best_lbl
+
+        def _enforce_joint_k() -> None:
+            min_k = policy.min_group_size
+            if min_k <= 1:
+                return
+            # Escalate one QI tier globally across all failing classes before advancing to the next,
+            # so cohorts converge at the least-destructive joint k-anonymous level.
+            for step in ("drop_pin", "drop_dob", "widen_age", "drop_dist", "drop_gender"):
+                sigs = {ck: _joint_sig(ck, cluster_tier[ck]) for ck in cluster_tier}
+                sig_counts = Counter(sigs.values())
+                failing = [ck for ck in sorted(cluster_tier) if sig_counts[sigs[ck]] < min_k]
+                if not failing:
+                    break
+                for ck in failing:
+                    band, keep_d, keep_p, lvl, keep_g = cluster_tier[ck]
+                    if step == "drop_pin" and keep_p:
+                        cluster_tier[ck] = (band, keep_d, False, "widened" if lvl == "standard" else lvl, keep_g)
+                    elif step == "drop_dob" and lvl == "standard":
+                        cluster_tier[ck] = (band, keep_d, False, "widened", keep_g)
+                    elif step == "widen_age":
+                        wide_lbl = _widest_peer_band(ck)
+                        if wide_lbl and band != wide_lbl:
+                            cluster_tier[ck] = (wide_lbl, keep_d, False, "suppressed" if not keep_d else ("widened" if lvl == "standard" else lvl), keep_g)
+                    elif step == "drop_dist" and (keep_d or lvl != "suppressed"):
+                        cluster_tier[ck] = (band, False, False, "suppressed", keep_g)
+                    elif step == "drop_gender" and keep_g:
+                        cluster_tier[ck] = (band, False, False, "suppressed", False)
+
+        _enforce_joint_k()
+
+        # Post-widening l-diversity check (l >= 2 distinct conditions per equivalence class when heterogeneous peers exist)
+        all_corpus_conds = {cond for conds in profile_conds.values() for cond in conds}
+        if len(all_corpus_conds) >= 2 and len(cluster_units) >= max(policy.min_group_size, 6):
+            for _ in range(3):
+                sigs = {ck: _joint_sig(ck, cluster_tier[ck]) for ck in cluster_tier}
+                sig_members: dict[tuple[str, str, str, str, str], list[str]] = defaultdict(list)
+                for ck, sig in sigs.items():
+                    sig_members[sig].append(ck)
+
+                l_changed = False
+                for sig, members in sorted(sig_members.items()):
+                    conds_cell = {cond for ck in members for cond in profile_conds[ck]}
+                    if len(conds_cell) != 1:
+                        continue
+                    ages_cell = [m.age for ck in members for m in cluster_units[ck] if m.age is not None]
+                    # Find best peer cluster carrying another diagnosis so both classes can jointly share a wider QI bracket
+                    best_merge: tuple[int, tuple[str | None, bool, bool, str, bool], list[str]] | None = None
+                    for ock in sorted(cluster_units):
+                        if sigs[ock] == sig or not profile_conds[ock] or profile_conds[ock] <= conds_cell:
+                            continue
+                        peer_sig = sigs[ock]
+                        peer_members = sig_members[peer_sig]
+                        ages_both = ages_cell + [m.age for pm in peer_members for m in cluster_units[pm] if m.age is not None]
+                        if not ages_both:
+                            continue
+                        shared_band = _hull_age_band(ages_both, 20, 80)
+                        if shared_band == "[AGE]":
+                            continue
+                        same_dist = (
+                            len({profile_district[x] for x in (*members, *peer_members)}) == 1
+                            and all(cluster_tier[x][1] for x in (*members, *peer_members))
+                        )
+                        same_gen = (
+                            len({profile_gender[x] for x in (*members, *peer_members)}) == 1
+                            and all(cluster_tier[x][4] for x in (*members, *peer_members))
+                        )
+                        # Prefer keeping district & gender cleanly; cost 0 = keep both, 1 = drop dist, 2 = drop dist + gen
+                        cost = (0 if same_dist else 1) + (0 if same_gen else 1)
+                        cand_tier = (
+                            shared_band,
+                            same_dist,
+                            False,
+                            "widened" if same_dist else "suppressed",
+                            same_gen,
+                        )
+                        if best_merge is None or cost < best_merge[0]:
+                            best_merge = (cost, cand_tier, peer_members)
+                            if cost == 0:
+                                break
+                    if best_merge is not None:
+                        _, target_tier, peer_members = best_merge
+                        for m_ck in (*members, *peer_members):
+                            cluster_tier[m_ck] = target_tier
+                        l_changed = True
+                        break
+                if not l_changed:
+                    break
+            _enforce_joint_k()
 
     # Assign collision-free pseudonyms & shifts deterministically in sorted cluster order
     cluster_pid: dict[str, str] = {}
@@ -409,12 +706,17 @@ def apply_privacy_to_text(
 
     out = _TXT_WA_HEADER_RE.sub(_wa_sub, out)
 
-    # 2. Shift dated lines (Admission, Discharge, Visit, DOB, तारीख, etc.)
+    # 2. Shift clinical dated lines, truncate DOB to YYYY on standard tier or [DOB] when widened/suppressed
     def _line_sub(m: re.Match) -> str:
         nonlocal changed
         line = m.group(1)
-        if re.search(r"(?i)\bDOB\b|जन्म", line) and plan.generalization_level != "standard":
+        if re.search(r"(?i)\b(?:DOB|Birth|Janm)\b|जन्म", line):
             changed = True
+            if plan.generalization_level != "standard":
+                return re.sub(r"\b\d{1,4}[/-]\d{1,2}[/-]\d{1,4}\b", "[DOB]", line)
+            iso_dob = parse_date_string(line, date_order)
+            if iso_dob:
+                return re.sub(r"\b\d{1,4}[/-]\d{1,2}[/-]\d{1,4}\b", iso_dob[:4], line)
             return re.sub(r"\b\d{1,4}[/-]\d{1,2}[/-]\d{1,4}\b", "[DOB]", line)
         new_line = shift_date_token(line, plan.date_shift_days, date_order)
         if new_line != line:
@@ -454,7 +756,7 @@ def apply_privacy_to_text(
         out = _TXT_AGE_ANCHOR_RE.sub(_age_anchor_sub, out)
 
     if not plan.keep_district:
-        out_d = re.sub(r"(?i)((?:Distt?\.?|जिला)\s*[:.]?\s*)([^\n,।-]+)", r"\1Uttar Pradesh", out)
+        out_d = re.sub(r"(?i)(?:Distt?\.?|District|जिला|जनपद)\s*[:.]?\s*[^\n,।-]+", "[DISTRICT]", out)
         if out_d != out:
             out = out_d
             changed = True
@@ -510,7 +812,8 @@ def apply_privacy_to_structured_record(
                     res[k] = "[DOB]"
                 else:
                     order = date_orders.get((file_rel, k), "dmy")
-                    res[k] = shift_date_token(sv, plan.date_shift_days, order)
+                    iso_dob = parse_date_string(sv, order)
+                    res[k] = iso_dob[:4] if iso_dob else "[DOB]"
                 changed = True
             elif role == "date":
                 order = date_orders.get((file_rel, k), "dmy")
@@ -520,7 +823,7 @@ def apply_privacy_to_structured_record(
                 res[k] = "[VILLAGE]"
                 changed = True
             elif role == "district":
-                res[k] = sv if plan.keep_district else "Uttar Pradesh"
+                res[k] = sv if plan.keep_district else "[DISTRICT]"
                 if not plan.keep_district:
                     changed = True
             elif role == "pin":
@@ -553,14 +856,14 @@ def apply_privacy_to_fhir_bundle(
         rtype = res.get("resourceType")
         if rtype == "Patient":
             if res.get("birthDate"):
-                if plan.generalization_level == "suppressed":
+                if plan.generalization_level != "standard":
                     res.pop("birthDate", None)
-                elif plan.generalization_level != "standard":
-                    # Year-only or shifted year on high-risk profiles (keep valid FHIR date syntax: YYYY)
-                    iso = parse_date_string(str(res["birthDate"]), "iso")
-                    res["birthDate"] = iso[:4] if iso else "1900"
                 else:
-                    res["birthDate"] = shift_date_token(str(res["birthDate"]), plan.date_shift_days, "iso")
+                    m_yr = re.match(r"^(\d{4})\b", str(res["birthDate"]).strip())
+                    if m_yr:
+                        res["birthDate"] = m_yr.group(1)
+                    else:
+                        res.pop("birthDate", None)
                 changed = True
             for addr in res.get("address") or []:
                 if isinstance(addr, dict):
@@ -571,7 +874,7 @@ def apply_privacy_to_fhir_bundle(
                         addr["city"] = "[VILLAGE]"
                         changed = True
                     if "district" in addr and not plan.keep_district:
-                        addr["district"] = "Uttar Pradesh"
+                        addr["district"] = "[DISTRICT]"
                         changed = True
                     if "postalCode" in addr:
                         addr["postalCode"] = generalize_pin(
