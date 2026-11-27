@@ -74,7 +74,7 @@ class RecordUnit:
     file_rel: str
     loc: str                         # "row:N", "/json/pointer", or "doc"
     format_type: str                 # "csv" | "tsv" | "json" | "fhir" | "txt"
-    hospital_hint: str = ""          # e.g. "snj" | "jjh" | "ass" | "dhh" | ""
+    hospital_hint: str = ""          # normalized facility slug inferred from document or path
     raw_text: str = ""
     structured_fields: dict[str, Any] = field(default_factory=dict)
     extracted_dates: tuple[DateMention, ...] = ()

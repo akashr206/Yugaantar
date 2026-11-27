@@ -12,8 +12,17 @@ from collections import defaultdict
 from typing import Any
 
 from rakshak.contracts import DateMention, IdentityClues, NameClue, RecordUnit
+from rakshak.schema_profiler import (
+    classify_key_for_clues,
+    clue_kind_for_role,
+    is_clean_reference_file,
+    parse_date_string as _schema_parse_date,
+    profile_records_keys,
+)
 from rakshak.translit import (
     extract_name_tokens,
+    fold_homoglyphs,
+    is_valid_verhoeff,
     norm_aadhaar,
     norm_aadhaar_last4,
     norm_abha,
@@ -26,84 +35,135 @@ from rakshak.translit import (
 )
 
 _MONTH_MAP = {
-    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
-    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
-    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
-    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+    "jan": 1, "january": 1, "जनवरी": 1,
+    "feb": 2, "february": 2, "फरवरी": 2,
+    "mar": 3, "march": 3, "मार्च": 3,
+    "apr": 4, "april": 4, "अप्रैल": 4,
+    "may": 5, "मई": 5,
+    "jun": 6, "june": 6, "जून": 6,
+    "jul": 7, "july": 7, "जुलाई": 7,
+    "aug": 8, "august": 8, "अगस्त": 8,
+    "sep": 9, "sept": 9, "september": 9, "सितंबर": 9, "सितम्बर": 9,
+    "oct": 10, "october": 10, "अक्टूबर": 10, "अक्तूबर": 10,
+    "nov": 11, "november": 11, "नवंबर": 11, "नवम्बर": 11,
+    "dec": 12, "december": 12, "दिसंबर": 12, "दिसम्बर": 12,
 }
 
 _ISO_DATE_RE = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
 _SLASH_DATE_RE = re.compile(r"\b(\d{1,2})([/.-])(\d{1,2})\2(\d{2}|\d{4})\b")
+_MONTH_TOKEN_ALT = (
+    r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|"
+    r"जनवरी|फरवरी|मार्च|अप्रैल|मई|जून|जुलाई|अगस्त|सितंबर|सितम्बर|अक्टूबर|अक्तूबर|नवंबर|नवम्बर|दिसंबर|दिसम्बर"
+)
 _TEXT_DATE_RE = re.compile(
-    r"\b(\d{1,2})\s+(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
-    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
-    r"(?:\s+(\d{4}))?\b",
+    rf"(?<!\d)(\d{{1,2}})\s+({_MONTH_TOKEN_ALT})(?:,?\s+(\d{{4}}))?(?!\d)",
+    re.I,
+)
+_US_TEXT_DATE_RE = re.compile(
+    rf"\b({_MONTH_TOKEN_ALT})\s+(\d{{1,2}}),?\s+(\d{{4}})\b",
     re.I,
 )
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[A-Za-z]{2,}")
-_PAN_RE = re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")
-_PMJAY_RE = re.compile(r"\b(?:PMJAY-[A-Z]{2}-\d+|POL/\d+/\d+)\b", re.I)
-_ABHA_ADDR_RE = re.compile(r"\b[\w.+-]+@(?:abdm|sbx|ndhm)\b", re.I)
-_AADHAAR_MASKED_RE = re.compile(r"\b[xX*]{4}[\s-]?[xX*]{4}[\s-]?\d{4}\b")
-_AADHAAR_RE = re.compile(r"(?<!\d)\d{4}[\s-]?\d{4}[\s-]?\d{4}(?!\d)")
-_ABHA_RE = re.compile(r"(?<!\d)\d{2}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}(?!\d)")
-_PHONE_RE = re.compile(r"(?<!\d)(?:\+?91[\s-]?|0)?[6-9]\d{4}[\s-]?\d{5}(?!\d)")
+_PAN_RE = re.compile(r"\b[A-Z]{5}\s?\d{4}\s?[A-Z]\b")
+_PMJAY_RE = re.compile(
+    r"\b(?:(?:PMJAY|ABHA|CGHS|ECHS|RSBY|TPA|POL|CLAIM|INS)[/_-][A-Z0-9]{2,}(?:[/_-]\d+)*|POL/\d+/\d+)\b",
+    re.I,
+)
+_ABHA_ADDR_RE = re.compile(r"\b[\w.+-]+@(?:abdm|sbx|ndhm|phr|nha)\b", re.I)
+_AADHAAR_MASKED_RE = re.compile(r"\b(?:\([xX*]{4}\)|[xX*]{4})[\s.-]?[xX*]{4}[\s.-]?\d{4}\b")
+_AADHAAR_RE = re.compile(r"(?<!\d\.)(?<!\d)(?:\(\d{4}\)|\d{4})[\s.-]?\d{4}[\s.-]?\d{4}(?!\d)")
+_ABHA_RE = re.compile(
+    r"(?<!\d\.)(?<!\d)(?!00)(?:\d{2}[\s.-]?\d{4}[\s.-]?\d{4}[\s.-]?\d{4}|(?!20\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))\d{14})(?!\d)"
+)
+_PHONE_RE = re.compile(
+    r"(?<!\d\.)(?<!\d)(?:(?:\(\+?91\)|\+?91|0091|0)[\s.-]?)?[6-9]\d{2}(?:[\s.-]?\d{3}[\s.-]?\d{4}|[\s.-]?\d{2}[\s.-]?\d{5}|\d{7})(?!\d)"
+)
+_LANDLINE_PHONE_RE = re.compile(r"(?<!\d\.)(?<!\d)0\d{2,4}[-.\s]\d{6,8}(?!\d)")
 _MRN_ANCHOR_RE = re.compile(
-    r"(?im)(?:UHID|MRN|IPD(?:\s*No\.?)?|Reg\.?\s*No\.?|Patient\s*ID|पंजीकरण\s*सं\.?|आईपीडी\s*सं\.?)\s*[:.#-]?\s*([A-Z0-9][A-Z0-9/-]{4,22})"
+    r"(?im)(?:(?:UHID|MRN|IPD|OPD|PID|UID|ADM|NHS|Patient|Pt\.?|Reg(?:n|\.?)|Registration|Case|Chart|File|Episode|Member|Subscriber|Beneficiary|Policy|Claim|Card|Token|Ticket|Ref(?:erence)?)"
+    r"(?:[ \t]+(?:No\.?|Num(?:ber)?|ID|Code|Ref|#))?|पंजीकरण[ \t]+सं\.?|आईपीडी[ \t]+सं\.?|मरी[ज़ज][ \t]+सं\.?)[ \t]*(?::|[ \t]*[=#|][ \t]*|[ \t]+-[ \t]+|[ \t]*\.[ \t]*)"
+    r"(?=[A-Za-z0-9/_#-]*\d)([A-Za-z0-9][A-Za-z0-9/_#-]{3,23})"
 )
 _MRN_RE = re.compile(
-    r"\b(?!(?:OPD|POL|PMJAY|COVID|SARS|LOINC|ICD)\b)"
-    r"(?:[A-Z]{2,6}(?:\d{2,4})?[/-]\d{2,4}[/-]\d{4,8}|[A-Z]{2,6}-\d{5,9}|ADM\d{5,8})\b",
+    r"\b(?!(?:OPD|POL|PMJAY|CGHS|ECHS|COVID|SARS|HIV|HBV|HCV|LOINC|SNOMED|ICD|TAB|CAP|INJ|SYP|"
+    r"JAN|JANUARY|FEB|FEBRUARY|MAR|MARCH|APR|APRIL|MAY|JUN|JUNE|JUL|JULY|AUG|AUGUST|SEP|SEPT|SEPTEMBER|OCT|OCTOBER|NOV|NOVEMBER|DEC|DECEMBER)\b)"
+    r"(?:[A-Z]{2,6}(?:\d{2,4})?[/_-]\d{2,4}[/_-]\d{3,8}|[A-Z]{1,6}(?:\d{2,4})?[-_/#]\d{4,10}|20\d{2}[/_-][A-Z]{2,6}[/_-]\d{3,8}|(?:ADM|UHID|MRN|PID|REG)\d{4,9})\b",
     re.I,
 )
 _PIN_RE = re.compile(r"(?<!\d)([1-9]\d{5})(?!\d)")
 
-# Free-text anchors (English, Devanagari, Hinglish)
-_DOC_SKIP_RE = re.compile(r"^\s*(?:Dr\.?|डॉ\.?|Consultant|Referred\s+by)\b", re.I)
+# Free-text anchors (English, Devanagari, Hinglish — compositional label + delimiter grammar)
+_DOC_SKIP_RE = re.compile(r"^\s*(?:Dr\.?|डॉ\.?|Consultant|Referred\s+by|Attending\s+Physician)\b", re.I)
 _NAME_ANCHOR_RE = re.compile(
-    r"(?im)(?:Patient\s*Name|Pt\.?\s*Name|मरीज़\s*का\s*नाम|नाम|Report\s+of)\s*[:\-]\s*([^\n,|/]+?)(?=\s+(?:Age|Sex|आयु|लिंग|UHID|IPD|Mob|$)|\s*[\n,|/]|$)"
+    r"(?im)(?<!Panel[ \t])(?<!Test[ \t])(?<!Drug[ \t])(?<!Lab[ \t])(?<!Hospital[ \t])(?<!Facility[ \t])(?<!Doctor[ \t])(?<!Department[ \t])(?<!Consultant[ \t])(?<!Physician[ \t])"
+    r"(?:(?:(?:Patient|Pt\.?|Subject|Client|Applicant|Subscriber|Beneficiary|Member|Claimant|Person|Payee|Issued[ \t]+to|Examined[ \t]+for|Report[ \t]+of)"
+    r"(?:[ \t]+(?:Full|Legal|First|Last|Display|Primary))?[ \t]+Name|(?:Full|Legal|Display)[ \t]+Name|Name|"
+    r"मरी[ज़ज][ \t]*(?:का[ \t]+नाम)?|रोगी[ \t]*(?:का[ \t]+नाम)?|अभ्यर्थी[ \t]*(?:का[ \t]+नाम)?|नाम)(?:[ \t]*:[ \t]*|[ \t]*[=|][ \t]*|[ \t]+-[ \t]+)|"
+    r"(?:Patient|Pt\.?|Subject|Client|Subscriber|Beneficiary|Member|Claimant|Payee|Issued[ \t]+to|Examined[ \t]+for|Report[ \t]+of)[ \t]*[:=][ \t]*)"
+    r"([^\n,|/]+?)"
+    r"(?=\s+(?:Age|Sex|DOB|Birth|Date|Phone|Mob|Mobile|Tel|Aadhaar|ABHA|Gender|Address|आयु|उम्र|लिंग|पता|UHID|IPD|MRN|$)|\s*[\n,|/]|$)"
 )
 _HINGLISH_HON_RE = re.compile(
-    r"\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)\s+(?:ji|sahab|saheb|babu|amma|didi|behenji|bahanji|bhai)\b"
+    r"\b(?!(?:of|for|by|to|from|in|on|at|the|and|with|report|patient|doctor|dr)\b)"
+    r"([A-Za-z][a-zA-Z.'-]{1,}(?:\s+(?!(?:of|for|by|to|from|in|on|at|the|and|with|report|patient|doctor|dr)\b)[A-Za-z][a-zA-Z.'-]{1,})?)"
+    r"\s+(?:ji|sahab|saheb|babu|amma|didi|behenji|bahanji|bhai)\b",
+    re.I,
 )
 _NURSING_TIME_NAME_RE = re.compile(
     r"(?:^|\b)\d{2}:\d{2}[ \t]*-[ \t]*([A-Z][a-zA-Z.'-]+(?:[ \t]+[A-Z][a-zA-Z.'-]+){0,3})[ \t]*-"
 )
 _NURSING_NON_NAMES = frozenset({"patient", "dr", "ward", "vitals", "note", "next", "morning", "evening"})
 _KINSHIP_OPEN_RE = re.compile(
-    r"(?m)^([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)\s*,\s*(?:S/[oO]|D/[oO]|W/[oO])\s+([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)"
+    r"(?m)^([A-Za-z][a-zA-Z.'-]{1,}(?:\s+[A-Za-z][a-zA-Z.'-]{1,})?)\s*,\s*(?:S/[oO]|D/[oO]|W/[oO]|C/[oO])\s+"
+    r"([A-Za-z][a-zA-Z.'-]{1,}(?:\s+[A-Za-z][a-zA-Z.'-]{1,})?)"
 )
-_DEVA_STORY_RE = re.compile(r"([\u0900-\u097F]{2,}(?:\s+[\u0900-\u097F]{2,}){1,2})\s+को\s+\d+")
+_DEVA_STORY_RE = re.compile(
+    r"([\u0900-\u097F]{2,}(?:\s+[\u0900-\u097F]{2,}){1,2})\s+को\s+(?:\d+\s*(?:दिन|हफ्ते|सप्ताह|माह|साल|वर्ष)|तेज|कल|बुखार|दर्द)"
+)
 _REL_ANCHOR_RE = re.compile(
-    r"(?im)(?:(?:S/[oO]|D/[oO]|W/[oO])\s*[:\-]?|पिता\s*का\s*नाम\s*[:\-]|पति\s*का\s*नाम\s*[:\-])\s*([^\n,;()]+)"
+    r"(?im)(?:(?:S/[oO]|D/[oO]|W/[oO])[ \t]*[:\-]?|(?:पिता[ \t]+का[ \t]+नाम|पति[ \t]+का[ \t]+नाम|अभिभावक(?:[ \t]+का[ \t]+नाम)?|"
+    r"Father(?:'s)?(?:[ \t]+Full)?[ \t]+Name|Mother(?:'s)?(?:[ \t]+Full)?[ \t]+Name|Husband(?:'s)?(?:[ \t]+Full)?[ \t]+Name|"
+    r"Spouse(?:[ \t]+Name)?|Caregiver|Emergency[ \t]+Contact)(?:[ \t]*:[ \t]*|[ \t]*[=|][ \t]*|[ \t]+-[ \t]+))[ \t]*([^\n,;()]+)"
 )
 _ATTENDANT_RE = re.compile(
-    r"(?im)\bAttendant\s*[:\-]\s*([^\n,;()]+)"
+    r"(?im)\b(?:Attendant|Guardian|Nominee|Next[ \t]+of[ \t]+kin|Caregiver|Emergency[ \t]+Contact)(?:[ \t]*:[ \t]*|[ \t]*[=|][ \t]*|[ \t]+-[ \t]+)[ \t]*([^\n,;()]+)"
 )
-_CO_ANCHOR_RE = re.compile(r"\bC/[oO]\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})")
+_CO_ANCHOR_RE = re.compile(r"\bC/[oO]\s+([A-Za-z][a-zA-Z.'-]*(?:\s+[A-Za-z][a-zA-Z.'-]*){0,2})")
 _CO_STOPWORDS = frozenset({
     "fever", "pain", "cough", "cold", "weakness", "vomiting", "headache",
-    "breathlessness", "dyspnea", "chest", "abdomen", "abdominal", "loose",
-    "motions", "diarrhea", "diarrhoea", "swelling", "rash", "dizziness",
+    "breathlessness", "dyspnea", "dyspnoea", "chest", "abdomen", "abdominal", "loose",
+    "motions", "stools", "diarrhea", "diarrhoea", "swelling", "rash", "dizziness",
     "generalised", "generalized", "acute", "chronic", "high", "low", "mild",
     "severe", "dm", "dm2", "htn", "tb", "cad", "copd", "ckd",
 })
 
 _AGE_ANCHOR_RE = re.compile(
-    r"(?:Age(?:/Sex)?|आयु)\s*[:\-]\s*(\d{1,3})\s*(?:Yrs?|Y|वर्ष)?(?:\s*/\s*([MF]|पुरुष|महिला))?",
+    r"(?:Age(?:/Sex)?|Umar|Umra|आयु|उम्र)\s*[:\-]\s*(\d{1,3})\s*(?:Yrs?|Years?|Y|वर्ष|साल)?(?:\s*/\s*(Male|Female|[MFO]|पुरुष|पुरूष|महिला|स्त्री|नर|मादा))?",
     re.I,
 )
 _AGE_SLASH_SEX_RE = re.compile(
-    r"\b(\d{1,3})\s*(?:Yrs?|Y|वर्ष)?\s*/\s*([MF]|पुरुष|महिला)\b",
+    r"\b(\d{1,3})\s*(?:Yrs?|Years?|Y|वर्ष|साल)?\s*/\s*(Male|Female|[MFO]|पुरुष|पुरूष|महिला|स्त्री|नर|मादा)\b",
     re.I,
 )
-_DEVA_AGE_ONLY_RE = re.compile(r"आयु\s*[:\-]\s*(\d{1,3})\s*वर्ष")
+_DEVA_AGE_ONLY_RE = re.compile(r"(?:आयु|उम्र)\s*[:\-]\s*(\d{1,3})\s*(?:वर्ष|साल)")
 
-_VILLAGE_TEXT_RE = re.compile(r"(?:Vill\.?|ग्राम)\s*[:.]?\s*([^\n,।-]+)", re.I)
-_DIST_TEXT_RE = re.compile(r"(?:Distt?\.?|जिला)\s*[:.]?\s*([^\n,।-]+)", re.I)
+_VILLAGE_TEXT_RE = re.compile(r"(?:Vill\.?|Village|Gram|ग्राम)\s*[:.]?\s*([^\n,।-]+)", re.I)
+_DIST_TEXT_RE = re.compile(r"(?:Distt?\.?|District|जिला|जनपद)\s*[:.]?\s*([^\n,।-]+)", re.I)
 
 _NON_PATIENT_CLEAN_HINTS = ("protocol", "formulary", "reference_ranges", "ward_census", "readme")
+
+
+_NON_CLUE_NAME_WORDS = frozenset({
+    "routine", "diagnosis", "history", "complaint", "complaints", "panel", "panels",
+    "unknown", "none", "stable", "normal", "positive", "negative", "pending",
+    "approved", "settled", "closed", "open", "hospital", "clinic", "laboratory",
+    "pharmacy", "department", "medicine", "surgery", "pediatrics", "gynaecology",
+    "fever", "pain", "cough", "blood", "pressure", "serum", "urine", "glucose",
+    "creatinine", "haemoglobin", "hemoglobin", "platelet", "cholesterol",
+    "vitals", "review", "admitted", "discharged", "patient", "comfortable", "afebrile",
+})
 
 
 def _make_name_clue(raw: str, role: str = "patient") -> NameClue | None:
@@ -114,7 +174,7 @@ def _make_name_clue(raw: str, role: str = "patient") -> NameClue | None:
     if re.search(r"\d", cleaned):
         return None
     toks = extract_name_tokens(cleaned)
-    if not toks:
+    if not toks or all(t in _NON_CLUE_NAME_WORDS for t in toks):
         return None
     ptoks = phonetic_name_tokens(cleaned)
     return NameClue(raw=cleaned, latin_tokens=toks, phonetic_tokens=ptoks, role=role)
@@ -122,11 +182,11 @@ def _make_name_clue(raw: str, role: str = "patient") -> NameClue | None:
 
 def _normalize_gender(raw: str) -> str | None:
     s = normalize_digits(raw).strip().casefold()
-    if s in ("m", "male", "पुरुष"):
+    if s in ("m", "male", "पुरुष", "पुरूष", "नर", "पु", "पु."):
         return "M"
-    if s in ("f", "female", "महिला"):
+    if s in ("f", "female", "महिला", "स्त्री", "मादा", "म", "म."):
         return "F"
-    if s in ("o", "other", "transgender"):
+    if s in ("o", "other", "transgender", "अन्य"):
         return "O"
     return None
 
@@ -254,7 +314,13 @@ def infer_file_date_orders(units: list[RecordUnit]) -> dict[tuple[str, str], str
 
 
 def parse_date_string(raw: str, order: str = "dmy") -> str | None:
-    """Parse a date string into YYYY-MM-DD using the inferred DMY/MDY/ISO order."""
+    """Parse a date string or dated text line into YYYY-MM-DD using unified date rules."""
+    direct = _schema_parse_date(raw, preferred_order=order)
+    if direct is not None and 1900 <= direct.year <= 2035:
+        return direct.isoformat()
+
+    from rakshak.schema_profiler import _TEXT_DMY_FLEX_RX, _TEXT_US_FLEX_RX, _TEXT_YMD_FLEX_RX
+
     s = normalize_digits(raw).strip()
     m_iso = _ISO_DATE_RE.search(s)
     if m_iso:
@@ -267,7 +333,10 @@ def parse_date_string(raw: str, order: str = "dmy") -> str | None:
     m_sl = _SLASH_DATE_RE.search(s)
     if m_sl:
         p1, p2, y_raw = int(m_sl.group(1)), int(m_sl.group(3)), int(m_sl.group(4))
-        y = 2000 + y_raw if y_raw < 100 else y_raw
+        if len(m_sl.group(4)) >= 4 or y_raw >= 100:
+            y = y_raw
+        else:
+            y = 2000 + y_raw if y_raw <= 35 else 1900 + y_raw
         d, mo = (p2, p1) if order == "mdy" else (p1, p2)
         if mo > 12 and d <= 12:
             d, mo = mo, d
@@ -276,77 +345,55 @@ def parse_date_string(raw: str, order: str = "dmy") -> str | None:
         try:
             return dt.date(y, mo, d).isoformat()
         except ValueError:
-            # Try swapped if invalid calendar date
             try:
                 return dt.date(y, d, mo).isoformat()
             except ValueError:
                 return None
 
-    m_txt = _TEXT_DATE_RE.search(s)
-    if m_txt and m_txt.group(3):
+    def _exp_y(yr_str: str) -> int:
+        yi = int(yr_str)
+        if len(yr_str) >= 4 or yi >= 100:
+            return yi
+        return 2000 + yi if yi <= 35 else 1900 + yi
+
+    m_ymdt = _TEXT_YMD_FLEX_RX.search(s)
+    if m_ymdt:
+        y = int(m_ymdt.group(1))
+        mo = _MONTH_MAP.get(m_ymdt.group(2).lower())
+        d = int(m_ymdt.group(3))
+        if mo:
+            try:
+                return dt.date(y, mo, d).isoformat()
+            except ValueError:
+                return None
+
+    m_txt = _TEXT_DMY_FLEX_RX.search(s)
+    if m_txt:
         d = int(m_txt.group(1))
-        mo = _MONTH_MAP[m_txt.group(2).lower()]
-        y = int(m_txt.group(3))
-        try:
-            return dt.date(y, mo, d).isoformat()
-        except ValueError:
-            return None
+        mo = _MONTH_MAP.get(m_txt.group(2).lower())
+        y = _exp_y(m_txt.group(3))
+        if mo:
+            try:
+                return dt.date(y, mo, d).isoformat()
+            except ValueError:
+                return None
+
+    m_us = _TEXT_US_FLEX_RX.search(s)
+    if m_us:
+        mo = _MONTH_MAP.get(m_us.group(1).lower())
+        d = int(m_us.group(2))
+        y = _exp_y(m_us.group(3))
+        if mo:
+            try:
+                return dt.date(y, mo, d).isoformat()
+            except ValueError:
+                return None
     return None
 
 
 def _classify_key(key: str) -> str:
-    """Classify a CSV header or JSON key into a semantic role using token boundaries."""
-    k = re.sub(r"[^a-z0-9\u0900-\u097F]+", "_", key.lower()).strip("_")
-    if not k:
-        return "other"
-    toks = set(k.split("_"))
-    if toks & {"relative", "guardian", "father", "husband", "pita", "pati"} or "pita_pati" in k:
-        return "relative"
-    if k in ("firstname", "first_name", "first"):
-        return "first_name"
-    if k in ("lastname", "last_name", "last"):
-        return "last_name"
-    if k in ("patient_name", "naam", "नाम", "name") or ({"patient", "name"} <= toks):
-        return "patient_name"
-    if toks & {"mobile", "phone", "tel", "contact", "callback", "mob", "मोबाइल"}:
-        return "phone"
-    if "email" in toks:
-        return "email"
-    if toks & {"aadhaar", "aadhar", "aadhar_no", "aadhaar_no"} or "aadhaar" in k or "aadhar" in k:
-        return "aadhaar"
-    if "abha" in toks and "address" in toks:
-        return "abha_addr"
-    if "abha" in toks:
-        return "abha"
-    if "pan" in toks or "payer_pan" in k:
-        return "pan"
-    if toks & {"pmjay", "policy", "insurance"} or "pmjay" in k or "policy" in k:
-        return "insurance"
-    if toks & {"uhid", "mrn", "ipd", "patientid"} or k in ("reg_no", "patient_ref", "patient_id", "hospital_uhid"):
-        return "mrn"
-    if toks & {"dob", "birthdate", "birth"} or "janm" in k:
-        return "dob"
-    if k == "age_sex":
-        return "age_sex"
-    if toks & {"age", "umar", "आयु"}:
-        return "age"
-    if toks & {"gender", "sex", "ling"}:
-        return "gender"
-    if toks & {"village", "gaon", "city", "ग्राम"}:
-        return "village"
-    if toks & {"district", "jila", "जिला"}:
-        return "district"
-    if toks & {"pin", "zip", "postalcode"}:
-        return "pin"
-    if toks & {"address", "pata", "street"}:
-        return "address"
-    if any(x in k for x in ("diagnos", "condition", "procedure")):
-        return "condition"
-    if toks & {"date", "admission", "discharge", "registered", "collected", "reported", "tithi"} or k.endswith("_date") or k.endswith("_on"):
-        return "date"
-    if toks & {"notes", "note", "remarks", "remark"}:
-        return "free_text"
-    return "other"
+    """Classify a CSV header or JSON key via unified schema_profiler rules."""
+    return classify_key_for_clues(key)
 
 
 def _extract_address_parts(text: str, villages: list[str], districts: list[str], pins: list[str]) -> None:
@@ -375,17 +422,17 @@ def _scan_text_ids(
     pans: list[str],
     ins_ids: list[str],
 ) -> None:
-    s = normalize_digits(text)
+    s = fold_homoglyphs(normalize_digits(text))
     for m in _EMAIL_RE.finditer(s):
         em = m.group(0).casefold()
-        if em.endswith(("@abdm", "@sbx", "@ndhm")):
+        if em.endswith(("@abdm", "@sbx", "@ndhm", "@phr", "@nha")):
             abha_addrs.append(em)
         else:
             emails.append(em)
     for m in _ABHA_ADDR_RE.finditer(s):
         abha_addrs.append(m.group(0).casefold())
     for m in _PAN_RE.finditer(s):
-        pans.append(m.group(0).upper())
+        pans.append(re.sub(r"\s+", "", m.group(0)).upper())
     for m in _PMJAY_RE.finditer(s):
         ins_ids.append(m.group(0).upper())
     for m in _MRN_ANCHOR_RE.finditer(s):
@@ -417,11 +464,20 @@ def _scan_text_ids(
             return " " * len(m.group(0))
         return m.group(0)
 
+    def _mask_verhoeff_aadhaar(m: re.Match) -> str:
+        raw = m.group(0)
+        if is_valid_verhoeff(raw):
+            aadhaars.append(raw)
+            return " " * len(raw)
+        return raw
+
     s_no_ids = _AADHAAR_RE.sub(_mask_aadhaar, s_no_abha)
-    for m in _PHONE_RE.finditer(s_no_ids):
-        ph = norm_phone(m.group(0))
-        if ph:
-            phones.append(ph)
+    s_no_ids = re.sub(r"(?<!\d\.)(?<!\d)[2-9]\d{11}(?!\d)", _mask_verhoeff_aadhaar, s_no_ids)
+    for rx_ph in (_PHONE_RE, _LANDLINE_PHONE_RE):
+        for m in rx_ph.finditer(s_no_ids):
+            ph = norm_phone(m.group(0))
+            if ph:
+                phones.append(ph)
 
 
 def _extract_fhir_bundle(
@@ -525,16 +581,41 @@ def _extract_fhir_bundle(
                     conditions.append(str(code_obj["text"]).strip().casefold())
 
 
+def infer_file_field_roles(units: list[RecordUnit]) -> dict[tuple[str, str], str]:
+    """Pool values per (file_rel, field_key_or_path) to infer roles of unseen CSV/JSON columns."""
+    by_file_records: dict[str, tuple[str, list[dict[str, Any]]]] = {}
+    for u in units:
+        if u.structured_fields and u.format_type in ("csv", "tsv", "json"):
+            if is_clean_reference_file(u.file_rel, u.format_type, u.structured_fields or None, u.raw_text):
+                continue
+            _, lst = by_file_records.setdefault(u.file_rel, (u.hospital_hint, []))
+            lst.append(u.structured_fields)
+
+    roles: dict[tuple[str, str], str] = {}
+    for file_rel, (hosp, recs) in by_file_records.items():
+        if len(recs) < 2:
+            # Even on single-record JSON/CSV, profile_records_keys still checks 1-cell strong patterns
+            prof_map = profile_records_keys(recs, hospital_hint=hosp)
+        else:
+            prof_map = profile_records_keys(recs, hospital_hint=hosp)
+        for key_or_path, cp in prof_map.items():
+            ck = clue_kind_for_role(cp.role)
+            if ck != "other":
+                roles[(file_rel, key_or_path)] = ck
+    return roles
+
+
 def extract_clues_for_unit(
     unit: RecordUnit,
     date_orders: dict[tuple[str, str], str] | None = None,
+    field_roles: dict[tuple[str, str], str] | None = None,
 ) -> IdentityClues:
     """Extract normalized IdentityClues from one RecordUnit."""
-    low_rel = unit.file_rel.lower()
-    if any(tok in low_rel for tok in _NON_PATIENT_CLEAN_HINTS) and unit.file_rel.startswith("clean/"):
+    if is_clean_reference_file(unit.file_rel, unit.format_type, unit.structured_fields or None, unit.raw_text):
         return IdentityClues(unit_id=unit.unit_id, file_rel=unit.file_rel, loc=unit.loc)
 
     date_orders = date_orders or {}
+    field_roles = field_roles or {}
     p_names: list[NameClue] = []
     r_names: list[NameClue] = []
     phones: list[str] = []
@@ -579,26 +660,43 @@ def extract_clues_for_unit(
                 p_names.append(nc)
 
         # Handle nested JSON patient/name/guardian/contact/address/ids dicts (dhh_patients.json, lab reports)
-        def _walk_dict(d: dict[str, Any], prefix: str = "", depth: int = 0) -> None:
+        def _resolve_role(key: str, dotted_path: str) -> str:
+            r = _classify_key(key)
+            if r != "other":
+                return r
+            return field_roles.get((unit.file_rel, dotted_path)) or field_roles.get((unit.file_rel, key)) or "other"
+
+        def _walk_dict(d: dict[str, Any], prefix: str = "", depth: int = 0, parent_key: str = "") -> None:
             if depth > 40:
                 return
+            low_parent = parent_key.lower()
+            protected_sub = low_parent in ("vitals", "rx", "diagnosis", "diagnoses", "panels", "facility", "hospital", "organization", "lab", "wards")
             for k, v in d.items():
                 if k == "_export_meta":
                     continue
-                role = _classify_key(k)
+                dotted = f"{prefix}.{k}" if prefix else k
+                if protected_sub:
+                    role = _classify_key(k)
+                    if role in ("patient_name", "relative", "age", "gender", "dob", "mrn"):
+                        role = "other"
+                else:
+                    role = _resolve_role(k, dotted)
                 if isinstance(v, dict):
-                    if k.lower() == "name" and ("first" in v or "last" in v or "local" in v):
-                        lat = f"{v.get('first', '')} {v.get('last', '')}".strip()
+                    kl = k.lower()
+                    if kl == "name" and low_parent not in ("panels", "facility", "hospital", "organization", "lab", "wards") and (
+                        "first" in v or "last" in v or "local" in v or "full" in v
+                    ):
+                        lat = f"{v.get('first', '')} {v.get('last', '')}".strip() or str(v.get("full") or "")
                         for cand in (lat, str(v.get("local") or "")):
                             nc = _make_name_clue(cand, "patient")
                             if nc:
                                 p_names.append(nc)
-                    elif k.lower() == "guardian" and v.get("name"):
+                    elif kl in ("guardian", "kin", "nominee", "next_of_kin", "spouse", "attendant", "caregiver", "relative", "father", "mother") and v.get("name"):
                         nc = _make_name_clue(str(v["name"]), "relative")
                         if nc:
                             r_names.append(nc)
                     else:
-                        _walk_dict(v, f"{prefix}{k}.", depth + 1)
+                        _walk_dict(v, dotted, depth + 1, k)
                     continue
                 if isinstance(v, list):
                     for item in v:
@@ -607,7 +705,7 @@ def extract_clues_for_unit(
                                 conditions.append(item["code"].strip())
                             elif "display" in item and isinstance(item["display"], str) and role == "condition":
                                 conditions.append(item["display"].strip().casefold())
-                            _walk_dict(item, f"{prefix}{k}[].", depth + 1)
+                            _walk_dict(item, f"{dotted}[]", depth + 1, k)
                         elif isinstance(item, str):
                             _scan_text_ids(item, phones, aadhaars, aadhaar_last4, abhas, abha_addrs, mrns, emails, pans, ins_ids)
                     continue
@@ -619,6 +717,8 @@ def extract_clues_for_unit(
                     continue
 
                 if role == "patient_name":
+                    if k.lower() == "name" and low_parent in ("panels", "facility", "hospital", "organization", "lab", "wards"):
+                        continue
                     nc = _make_name_clue(sv, "patient")
                     if nc:
                         p_names.append(nc)
@@ -648,7 +748,7 @@ def extract_clues_for_unit(
                     abha_addrs.append(sv.casefold())
                 elif role == "pan":
                     if _PAN_RE.search(sv.upper()):
-                        pans.append(sv.upper())
+                        pans.append(re.sub(r"\s+", "", sv).upper())
                 elif role == "insurance":
                     ins_ids.append(sv.upper())
                 elif role == "mrn":
@@ -865,15 +965,15 @@ def _extract_free_text_clues(
                 ages.append(a)
 
         # DOB & Clinical dates
-        if re.search(r"(?i)\bDOB\b|जन्म", line):
+        if re.search(r"(?i)\b(?:DOB|Birth\s*(?:Date|Dt)?|Born|Bday)\b|जन्म", line):
             iso = parse_date_string(line, date_order)
             if iso:
                 dobs.append(iso)
                 dates.append(DateMention(raw_text=line, iso_date=iso, role="dob", date_order=date_order))
-        elif re.search(r"(?i)Admission|Discharge|Visit|भर्ती|छुट्टी|तारीख|Date", line):
+        elif re.search(r"(?i)Admission|Admit|Discharge|Visit|Reg(?:istered|n|\.?)|Collected|Reported|भर्ती|छुट्टी|तारीख|दिनांक|Date", line):
             iso = parse_date_string(line, date_order)
             if iso:
-                d_role = "admission" if re.search(r"(?i)Admission|भर्ती", line) else (
+                d_role = "admission" if re.search(r"(?i)Admission|Admit|भर्ती", line) else (
                     "discharge" if re.search(r"(?i)Discharge|छुट्टी", line) else "clinical"
                 )
                 dates.append(DateMention(raw_text=line, iso_date=iso, role=d_role, date_order=date_order))
@@ -885,4 +985,5 @@ def _extract_free_text_clues(
 def extract_all_clues(units: list[RecordUnit]) -> list[IdentityClues]:
     """Batch-extract IdentityClues across all RecordUnits with per-file/column date inference."""
     date_orders = infer_file_date_orders(units)
-    return [extract_clues_for_unit(u, date_orders) for u in units]
+    field_roles = infer_file_field_roles(units)
+    return [extract_clues_for_unit(u, date_orders, field_roles=field_roles) for u in units]
