@@ -28,16 +28,27 @@ _ZW_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\ufeff]")
 
 # Generic filename PII detection patterns (zero hardcoded dev hospital names)
 _FN_PHONE_RX = re.compile(r"(?<!\d)(?:\+?91[-_]?)?0?[6-9]\d{9}(?!\d)")
-_FN_ABHA_RX = re.compile(r"(?<!\d)91[-_]?\d{4}[-_]?\d{4}[-_]?\d{4}(?!\d)")
+_FN_ABHA_RX = re.compile(r"(?<!\d)(?!00)\d{2}[-_]?\d{4}[-_]?\d{4}[-_]?\d{4}(?!\d)")
 _FN_AADHAAR_RX = re.compile(r"(?<!\d)\d{4}[-_]?\d{4}[-_]?\d{4}(?!\d)")
 _FN_PAN_RX = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{5}\d{4}[A-Za-z](?![A-Za-z0-9])")
-_FN_EMAIL_RX = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|[\w.+-]+@(?:abdm|sbx|ndhm|ok\w+|ybl|ibl|axl|paytm|upi)\b", re.I)
+_FN_EMAIL_RX = re.compile(
+    r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
+    r"[\w.+-]+@(?:abdm|sbx|ndhm|phr|nha|ok(?:axis|icici|hdfcbank|axisbank|sbi)|"
+    r"icici|hdfcbank|sbi|axisbank|kotak|ybl|ibl|axl|paytm|upi|apl|yapl|rapl|"
+    r"pingpay|jio|fampay|aubank|idfcbank)\b",
+    re.I,
+)
 
 _FN_MULTI_ID_RX = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{2,6}[-_]\d{2,4}(?:[-_]\d{2,})+(?![A-Za-z0-9])")
 _FN_COMPACT_ID_RX = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{2,6}\d{5,}(?![A-Za-z0-9])")
 _FN_HYPHEN_ID_RX = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,6})([-_])(\d{5,})(?![A-Za-z0-9])")
-_FN_LABELED_ID_RX = re.compile(r"(?i)(?<![A-Za-z0-9])(?:uhid|mrn|ipd|pid|uid|adm)[-_]?\d{2,}(?![A-Za-z0-9])")
-_ID_PREFIX_WORDS = frozenset({"uhid", "mrn", "ipd", "opd", "pid", "uid", "adm", "reg", "pat", "id", "bl"})
+_FN_LABELED_ID_RX = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:uhid|mrn|ipd|opd|pid|uid|adm|claim|pol|mem|ben|case)[-_]?\d{2,}(?![A-Za-z0-9])"
+)
+_ID_PREFIX_WORDS = frozenset({
+    "uhid", "mrn", "ipd", "opd", "pid", "uid", "adm", "reg", "pat",
+    "id", "bl", "claim", "pol", "mem", "ben", "hosp", "ref", "case", "vis",
+})
 
 # Universal non-PII file/medical/structural tokens (no dataset-specific hospital or lab names)
 _UNIVERSAL_GENERIC_TOKENS = frozenset(

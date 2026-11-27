@@ -15,15 +15,54 @@ from indic_transliteration.sanscript import transliterate
 from rapidfuzz import fuzz
 
 _DEVA_RE = re.compile(r"[\u0900-\u097F]")
-_ZW_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\ufeff]")
+_ZW_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\ufeff\u2060\u00ad]")
 _NON_ALNUM_SPACE_RE = re.compile(r"[^\w\s]", re.UNICODE)
 _DEVA_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+_HOMOGLYPH_TRANS = str.maketrans({
+    # Cyrillic uppercase
+    "\u0410": "A", "\u0412": "B", "\u0415": "E", "\u041a": "K", "\u041c": "M",
+    "\u041d": "H", "\u041e": "O", "\u0420": "P", "\u0421": "C", "\u0422": "T",
+    "\u0425": "X", "\u0406": "I", "\u0408": "J", "\u0405": "S",
+    # Cyrillic lowercase
+    "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p", "\u0441": "c",
+    "\u0443": "y", "\u0445": "x", "\u0456": "i", "\u0458": "j", "\u0455": "s", "\u0475": "v",
+    # Greek uppercase
+    "\u0391": "A", "\u0392": "B", "\u0395": "E", "\u0396": "Z", "\u0397": "H",
+    "\u0399": "I", "\u039a": "K", "\u039c": "M", "\u039d": "N", "\u039f": "O",
+    "\u03a1": "P", "\u03a4": "T", "\u03a5": "Y", "\u03a7": "X",
+    # Greek lowercase
+    "\u03b1": "a", "\u03b5": "e", "\u03b9": "i", "\u03bd": "v", "\u03bf": "o",
+    "\u03c1": "p", "\u03c4": "t", "\u03c5": "u", "\u03c7": "x",
+})
+_VERHOEFF_D = (
+    (0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+    (1, 2, 3, 4, 0, 6, 7, 8, 9, 5),
+    (2, 3, 4, 0, 1, 7, 8, 9, 5, 6),
+    (3, 4, 0, 1, 2, 8, 9, 5, 6, 7),
+    (4, 0, 1, 2, 3, 9, 5, 6, 7, 8),
+    (5, 9, 8, 7, 6, 0, 4, 3, 2, 1),
+    (6, 5, 9, 8, 7, 1, 0, 4, 3, 2),
+    (7, 6, 5, 9, 8, 2, 1, 0, 4, 3),
+    (8, 7, 6, 5, 9, 3, 2, 1, 0, 4),
+    (9, 8, 7, 6, 5, 4, 3, 2, 1, 0),
+)
+_VERHOEFF_P = (
+    (0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+    (1, 5, 7, 6, 2, 8, 3, 0, 9, 4),
+    (5, 8, 0, 3, 7, 9, 6, 1, 4, 2),
+    (8, 9, 1, 6, 0, 4, 3, 5, 2, 7),
+    (9, 4, 5, 3, 1, 2, 6, 8, 7, 0),
+    (4, 2, 8, 6, 5, 7, 3, 9, 0, 1),
+    (2, 7, 9, 3, 8, 0, 6, 4, 1, 5),
+    (7, 0, 4, 6, 9, 1, 3, 2, 5, 8),
+)
 
 # Honorifics / kinship titles stripped from person name tokens
 HONORIFIC_TOKENS = frozenset({
     "ji", "sahab", "saheb", "babu", "amma", "didi", "bhaiya", "bhai",
-    "behenji", "bahanji", "shri", "shrimati", "smt", "km",
-    "mr", "mrs", "ms", "miss", "dr", "prof", "late",
+    "behenji", "bahanji", "shri", "shrimati", "shriman", "sushri", "smt",
+    "kum", "ku", "km", "sh", "mr", "mrs", "ms", "miss", "dr", "prof",
+    "er", "adv", "col", "maj", "capt", "brig", "master", "baby", "late", "haji",
 })
 
 # Generic tokens that must never link two records on their own
@@ -32,7 +71,7 @@ GENERIC_NAME_TOKENS = frozenset({
     "lal", "ram", "prasad", "nath", "mohammad",
 })
 
-# Standard Indian English/Hinglish prefix expansions
+# Canonical cross-phonetic aliases (subsequence contractions are also matched algorithmically below)
 NAME_PREFIX_MAP = {
     "md": "mohammad",
     "mohd": "mohammad",
@@ -41,15 +80,44 @@ NAME_PREFIX_MAP = {
     "muhammad": "mohammad",
     "mhd": "mohammad",
     "sri": "shri",
+    "srimati": "shrimati",
+    "susri": "sushri",
 }
-
-_ITRANS_NUKTA_RE = re.compile(r"\.Dh?|\.N")
 
 
 def normalize_digits(text: str) -> str:
     """Fold NFKC, strip zero-width chars, and convert Devanagari digits to ASCII."""
     cleaned = _ZW_RE.sub("", unicodedata.normalize("NFKC", text))
     return cleaned.translate(_DEVA_DIGITS)
+
+
+def fold_homoglyphs(text: str, keep_deva_digits: bool = False) -> str:
+    """Strip zero-width obfuscation, normalize NFKC, fold Cyrillic/Greek homoglyphs and Latin accents."""
+    if text.isascii():
+        return text
+    cleaned = _ZW_RE.sub("", unicodedata.normalize("NFKC", text)).translate(_HOMOGLYPH_TRANS)
+    # Strip Latin combining accents while keeping Devanagari marks untouched
+    if any("\u0300" <= ch <= "\u036f" or unicodedata.category(ch) == "Mn" for ch in cleaned if not ("\u0900" <= ch <= "\u097f")):
+        out: list[str] = []
+        for ch in cleaned:
+            if "\u0900" <= ch <= "\u097f" or ord(ch) < 128:
+                out.append(ch)
+            else:
+                dec = unicodedata.normalize("NFKD", ch)
+                kept = "".join(c for c in dec if unicodedata.category(c) != "Mn")
+                out.append(kept)
+        cleaned = "".join(out)
+    return cleaned if keep_deva_digits else cleaned.translate(_DEVA_DIGITS)
+
+
+def is_valid_verhoeff(digits: str) -> bool:
+    """Validate Aadhaar Verhoeff check digit for a 12-digit ASCII numeric string."""
+    if len(digits) != 12 or not digits.isdigit():
+        return False
+    c = 0
+    for idx, ch in enumerate(reversed(digits)):
+        c = _VERHOEFF_D[c][_VERHOEFF_P[idx % 8][int(ch)]]
+    return c == 0
 
 
 def _apply_hindi_schwa_rules(itrans_word: str) -> str:
@@ -166,10 +234,69 @@ def phonetic_name_tokens(raw_name: str) -> tuple[str, ...]:
     return tuple(phonetic_normalize_token(t) for t in toks if phonetic_normalize_token(t))
 
 
+def _is_ordered_subseq(short: str, full: str) -> bool:
+    """Return True if all chars of `short` appear in order inside `full`."""
+    it = iter(full)
+    return all(ch in it for ch in short)
+
+
+def _is_token_abbreviation(a: str, b: str) -> bool:
+    """Detect Indian contractions (sk<->shaikh, kr<->kumar, pd<->prasad), truncations, or initials."""
+    if not a or not b or len(a) == len(b):
+        return False
+    short, full = (a, b) if len(a) < len(b) else (b, a)
+    if short[0] != full[0]:
+        return False
+    if len(short) == 1:
+        return len(full) >= 2
+    if len(short) >= 3 and full.startswith(short):
+        return True
+    if len(short) <= 5:
+        return _is_ordered_subseq(short, full)
+    return False
+
+
+def has_compatible_abbrev(tokens_a: tuple[str, ...], tokens_b: tuple[str, ...]) -> bool:
+    """Return True if two multi-token names agree symmetrically up to initials/truncations/contractions."""
+    pa = [phonetic_normalize_token(t) for t in tokens_a if t]
+    pb = [phonetic_normalize_token(t) for t in tokens_b if t]
+    if len(pa) < 2 or len(pb) < 2:
+        return False
+    sa = [consonant_skeleton(t) for t in tokens_a if t]
+    sb = [consonant_skeleton(t) for t in tokens_b if t]
+
+    def _pair_ok(x: str, y: str, sx: str, sy: str) -> tuple[bool, bool]:
+        if x == y or (sx == sy and len(sx) >= 2):
+            return True, len(x) >= 3 and len(y) >= 3
+        if jellyfish.jaro_winkler_similarity(x, y) >= 0.85 or fuzz.ratio(x, y) >= 85:
+            return True, True
+        if _is_token_abbreviation(x, y):
+            return True, False
+        return False, False
+
+    def _side_covered(p1: list[str], s1: list[str], p2: list[str], s2: list[str]) -> bool:
+        anchor = False
+        for i, x in enumerate(p1):
+            matched = False
+            for j, y in enumerate(p2):
+                ok, is_full = _pair_ok(x, y, s1[i], s2[j])
+                if ok:
+                    matched = True
+                    if is_full:
+                        anchor = True
+                    break
+            if not matched and len(x) > 1 and x not in GENERIC_NAME_TOKENS:
+                return False
+        return anchor
+
+    return _side_covered(pa, sa, pb, sb) and _side_covered(pb, sb, pa, sa)
+
+
 def name_tokens_match(tokens_a: tuple[str, ...], tokens_b: tuple[str, ...]) -> float:
     """Compute precision-oriented similarity in [0.0, 1.0] between two token tuples.
 
     Handles exact/phonetic matches, consonant-skeleton equality (e.g. akaram vs akram),
+    prefix truncations, ordered-consonant contractions (sk vs shaikh, kr vs kumar),
     and high Jaro-Winkler / RapidFuzz token match, while avoiding single generic-token matches.
     """
     if not tokens_a or not tokens_b:
@@ -186,13 +313,13 @@ def name_tokens_match(tokens_a: tuple[str, ...], tokens_b: tuple[str, ...]) -> f
     if sa == sb:
         return 0.96
 
-    # If one side is a single first name (e.g. "Asha" vs "Asha Rajput"), allow partial first-name match
-    # ONLY when the first token is non-generic and matches strongly.
     def _tok_sim(x: str, y: str, sx: str, sy: str) -> float:
         if x == y:
             return 1.0
-        if sx == sy and len(sx) >= 3:
+        if sx == sy and (len(sx) >= 3 or (len(sx) >= 2 and len(pa) >= 2 and len(pb) >= 2)):
             return 0.95
+        if len(x) >= 2 and len(y) >= 2 and _is_token_abbreviation(x, y):
+            return 0.87
         jw = jellyfish.jaro_winkler_similarity(x, y)
         rf = fuzz.ratio(x, y) / 100.0
         return max(jw * 0.95, rf)
@@ -226,13 +353,17 @@ def name_tokens_match(tokens_a: tuple[str, ...], tokens_b: tuple[str, ...]) -> f
 
 
 def norm_phone(raw: str) -> str | None:
-    """Normalize an Indian phone number to 10 digits starting with [6-9]."""
+    """Normalize an Indian phone number to 10 digits starting with [6-9], or valid STD landline."""
     digits = re.sub(r"\D", "", normalize_digits(raw))
-    if len(digits) == 12 and digits.startswith("91"):
+    if len(digits) == 14 and digits.startswith("0091"):
+        digits = digits[4:]
+    elif len(digits) == 12 and digits.startswith("91"):
         digits = digits[2:]
     elif len(digits) == 11 and digits.startswith("0"):
         digits = digits[1:]
     if len(digits) == 10 and digits[0] in "6789":
+        return digits
+    if re.search(r"[-.\s]", raw) and re.fullmatch(r"0\d{9,10}", digits):
         return digits
     return None
 
@@ -249,7 +380,7 @@ def norm_aadhaar(raw: str) -> str | None:
 def norm_aadhaar_last4(raw: str) -> str | None:
     """Extract last 4 digits from a masked Aadhaar such as 'XXXX XXXX 5866'."""
     s = normalize_digits(raw)
-    m = re.search(r"(?:[xX*]{4}[\s-]?){2}(\d{4})\b", s)
+    m = re.search(r"(?:(?:\([xX*]{4}\)|[xX*]{4})[\s.-]?){2}(\d{4})\b", s)
     return m.group(1) if m else None
 
 
@@ -274,8 +405,6 @@ def norm_mrn(raw: str) -> tuple[str, str, str] | None:
     digit_core = m_core.group(1) if m_core else digits
     m_pref = re.match(r"^([A-Z]{2,6})", s)
     prefix = m_pref.group(1).lower() if m_pref else ""
-    if prefix == "uhid":
-        prefix = "ass"
     canon = re.sub(r"[^A-Z0-9]", "", s).lower()
     return canon, digit_core, prefix
 
