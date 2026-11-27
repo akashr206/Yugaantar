@@ -10,7 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 from rakshak.contracts import IdentityClues
-from rakshak.translit import GENERIC_NAME_TOKENS, consonant_skeleton, name_tokens_match
+from rakshak.translit import GENERIC_NAME_TOKENS, consonant_skeleton, has_compatible_abbrev, name_tokens_match
 
 
 @dataclass
@@ -107,9 +107,14 @@ def _score_pair(a: IdentityClues, b: IdentityClues) -> float:
     name_sim = _name_pair_score(a, b)
     both_named = bool(a.patient_names and b.patient_names)
     both_multi = _both_multi_token_names(a, b)
+    abbrev_ok = both_multi and any(
+        has_compatible_abbrev(na.latin_tokens, nb.latin_tokens)
+        for na in a.patient_names
+        for nb in b.patient_names
+    )
 
     # If both records have multi-token full names and they strongly disagree, block soft/phone links
-    name_conflicts = both_multi and name_sim < 0.72
+    name_conflicts = both_multi and name_sim < 0.72 and not abbrev_ok
 
     # 2. Tier 1: Hard unique identifiers
     if a.aadhaars and b.aadhaars and not set(a.aadhaars).isdisjoint(b.aadhaars):
@@ -121,7 +126,7 @@ def _score_pair(a: IdentityClues, b: IdentityClues) -> float:
     if a.mrns and b.mrns and not set(a.mrns).isdisjoint(b.mrns):
         return 0.98 if not name_conflicts else 0.0
     if a.phones and b.phones and not set(a.phones).isdisjoint(b.phones):
-        if both_named and name_sim < 0.70:
+        if both_named and name_sim < 0.70 and not abbrev_ok:
             return 0.0
         return 0.97
     if a.pans and b.pans and not set(a.pans).isdisjoint(b.pans):
@@ -160,7 +165,8 @@ def _score_pair(a: IdentityClues, b: IdentityClues) -> float:
     # Corroborator 4: Last-4 Aadhaar + District + Age within +/-2
     if a.aadhaar_last4 and b.aadhaar_last4 and not set(a.aadhaar_last4).isdisjoint(b.aadhaar_last4):
         if a.district_norm and b.district_norm and a.district_norm == b.district_norm:
-            return 0.87
+            if _ages_compatible(a, b, max_diff=2):
+                return 0.87
 
     # Corroborator 5: Exact 6-digit PIN + Gender + Age +/-1 (only when full multi-token name matches)
     if both_multi and a.pin and b.pin and a.pin == b.pin and a.gender and b.gender and a.gender == b.gender:
@@ -236,9 +242,9 @@ def _clusters_compatible(ca: _ClusterState, cb: _ClusterState) -> bool:
         if hi - lo > 3:
             return False
     if ca.full_name_tokens and cb.full_name_tokens:
-        # Every pair of multi-token names across the two clusters must be reasonably compatible
-        if not any(
-            name_tokens_match(ta, tb) >= 0.72
+        # Every pair of multi-token names across the two clusters must be compatible
+        if not all(
+            name_tokens_match(ta, tb) >= 0.72 or has_compatible_abbrev(ta, tb)
             for ta in ca.full_name_tokens
             for tb in cb.full_name_tokens
         ):
