@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2000 780" width="2000" height="780" font-family="Inter, Segoe UI, Arial, sans-serif" xmlns:c2pa="http://c2pa.org/manifest">
+<defs>
+<style>
+.g{fill:none;stroke:#fff;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
+.e{fill:none;stroke:#334155;stroke-width:2.5}
+.n{font-size:14px;font-weight:700;fill:#0f172a;text-anchor:middle}
+.s{font-size:11.5px;fill:#64748b;text-anchor:middle}
+.t{font-size:12.5px;font-weight:600;fill:#334155;text-anchor:middle}
+.t{paint-order:stroke;stroke:#f8fafc;stroke-width:4px}
+</style>
+<marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5L0 10z" fill="#334155"/></marker>
+<marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5L0 10z" fill="#dc2626"/></marker>
+<marker id="ap" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5L0 10z" fill="#7c3aed"/></marker>
+<g id="fhir" class="g"><path d="M-16 -6h32v24h-32zM-4 18v-10h8v10M0 -22v12M-6 -16h12"/></g>
+<g id="notes" class="g"><path d="M-12 -20h16l10 10v28h-26zM4 -20v10h10M-6 0h12M-6 8h12"/></g>
+<g id="i-eye" class="g"><path d="M-20 0C-10 -16 10 -16 20 0C10 16 -10 16 -20 0Z"/><circle cx="0" cy="0" r="5"/><path d="M-17 17L17 -17"/></g>
+<g id="corrupt" class="g"><path d="M-12 -20h16l10 10v28h-26zM-6 -4l5 5l-5 5l8 5"/></g>
+<g id="clean" class="g"><path d="M-12 -20h16l10 10v28h-26zM-6 2l5 5l9 -10"/></g>
+<g id="ingest" class="g"><circle cx="-4" cy="-4" r="14"/><path d="M6 6L18 18"/></g>
+<g id="schema" class="g"><path d="M0 -22l18 7v11c0 12 -9 20 -18 25c-9 -5 -18 -13 -18 -25v-11zM-8 0l6 6l11 -12"/></g>
+<g id="link" class="g"><circle cx="-14" cy="12" r="5"/><circle cx="14" cy="12" r="5"/><circle cy="-14" r="5"/><path d="M-9 12h18M-11 8l8 -17M11 8l-8 -17"/></g>
+<g id="plan" class="g"><path d="M-14 -16h28v38h-28zM-6 -20h12v8h-12zM-8 -2l3 3l5 -6M2 -1h8M-8 12l3 3l5 -6M2 13h8"/></g>
+<g id="redact" class="g"><path d="M-16 -22h16l10 10v14M-16 -22v40h14M2 6h18v14h-18zM6 6v-4a5 5 0 0 1 10 0v4"/></g>
+<g id="vault" class="g"><path d="M-18 -18h36v36h-36zM0 -7v-4M0 7v4M-7 0h-4M7 0h4"/><circle r="7"/></g>
+<g id="key" class="g"><circle cx="-10" r="8"/><path d="M-2 0h22M14 0v8M20 0v6"/></g>
+<g id="json" class="g"><path d="M-6 -20q-8 0 -8 8v6q0 6 -6 6q6 0 6 6v6q0 8 8 8M6 -20q8 0 8 8v6q0 6 6 6q-6 0 -6 6v6q0 8 -8 8"/></g>
+<g id="bars" class="g"><path d="M-14 18v-12M-4 18v-26M6 18v-18M16 18v-32"/></g>
+<g id="quar" class="g"><path d="M-20 -10h40v28h-40zM-20 -10l6 -10h28l6 10M-6 2h12"/></g>
+</defs>
+<rect width="2000" height="780" fill="#f8fafc"/>
+<text x="1000" y="44" font-size="24" font-weight="800" fill="#0f172a" text-anchor="middle">RAKSHAK — Deterministic Two-Pass Clinical Privacy Firewall</text>
+
+<!-- EDGES -->
+<g class="e">
+<path d="M144 110H260V455H144M144 225H260M144 340H260"/>
+<path d="M260 300H442" marker-end="url(#a)"/>
+<path d="M144 600H442" marker-end="url(#a)"/>
+<path d="M516 300H762" marker-end="url(#a)"/>
+<path d="M800 336V522" marker-end="url(#a)"/>
+<path d="M836 560H1062V300H1082" marker-end="url(#a)"/>
+<path d="M1156 300H1402" marker-end="url(#a)"/>
+<path d="M1120 524V338" marker-end="url(#a)"/>
+<path d="M1476 300H1758M1640 140H1758M1640 460H1758" marker-end="url(#a)"/>
+<path d="M1640 140V460" />
+</g>
+<path d="M480 336V564" fill="none" stroke="#dc2626" stroke-width="2.5" stroke-dasharray="7 5" marker-end="url(#ar)"/>
+<path d="M480 636V720H1800V680" fill="none" stroke="#dc2626" stroke-width="2.5" marker-end="url(#ar)"/>
+<path d="M800 264V170H1440V262" fill="none" stroke="#7c3aed" stroke-width="2.5" stroke-dasharray="7 5" marker-end="url(#ap)"/>
+
+<!-- EDGE TAGS -->
+<g class="t">
+<text x="352" y="291">raw inputs</text>
+<text x="300" y="591">corrupt / binary</text>
+<text x="492" y="456" fill="#dc2626" style="text-anchor:start">QuarantineError</text>
+<text x="640" y="291">RecordUnit stream</text>
+<text x="812" y="440" style="text-anchor:start">clues + evidence</text>
+<text x="946" y="551">linked clusters</text>
+<text x="1120" y="161" fill="#7c3aed">Pass-1 date orders &amp; cluster redact surfaces</text>
+<text x="1280" y="291">privacy plan</text>
+<text x="1132" y="440" style="text-anchor:start">HMAC key</text>
+<text x="1558" y="291">verified release</text>
+<text x="1140" y="711" fill="#dc2626">AES-256-GCM at rest</text>
+</g>
+
+<!-- INPUTS -->
+<text x="110" y="62" font-size="13" font-weight="800" fill="#64748b" text-anchor="middle" letter-spacing="1">HETEROGENEOUS INPUTS</text>
+<g>
+<circle cx="110" cy="110" r="34" fill="#475569"/><use href="#fhir" transform="translate(110 110)"/>
+<text class="n" x="110" y="165">Structured &amp; FHIR</text><text class="s" x="110" y="181">CSV · TSV · Nested JSON</text>
+<circle cx="110" cy="225" r="34" fill="#475569"/><use href="#notes" transform="translate(110 225)"/>
+<text class="n" x="110" y="280">Unstructured Notes</text><text class="s" x="110" y="296">English · Hindi · Hinglish</text>
+<circle cx="110" cy="340" r="34" fill="#d97706"/><use href="#i-eye" transform="translate(110 340)"/>
+<text class="n" x="110" y="395">Hidden Channels</text><text class="s" x="110" y="411">&amp; Traps</text>
+<circle cx="110" cy="455" r="34" fill="#16a34a"/><use href="#clean" transform="translate(110 455)"/>
+<text class="n" x="110" y="510">Clean Formularies</text><text class="s" x="110" y="526">(Guarded)</text>
+<circle cx="110" cy="600" r="34" fill="#dc2626"/><use href="#corrupt" transform="translate(110 600)"/>
+<text class="n" x="110" y="655">Corrupt / Binary Files</text><text class="s" x="110" y="671">Bad UTF-8 · PDF · XML</text>
+</g>
+
+<!-- PIPELINE -->
+<g>
+<circle cx="480" cy="300" r="36" fill="#2563eb"/><use href="#ingest" transform="translate(480 300)"/>
+<text class="n" x="480" y="236">1. Ingest &amp; Sniff</text><text class="s" x="480" y="252">ingest.py · formats.py</text>
+
+<circle cx="800" cy="300" r="36" fill="#0e7490"/><use href="#schema" transform="translate(800 300)"/>
+<text class="n" x="846" y="290" style="text-anchor:start">2. Pass 1: Schema &amp; Clues</text><text class="s" x="846" y="307" style="text-anchor:start">schema_profiler</text><text class="s" x="846" y="322" style="text-anchor:start">clue_extractor</text>
+
+<circle cx="800" cy="560" r="36" fill="#0f766e"/><use href="#link" transform="translate(800 560)"/>
+<text class="n" x="800" y="618">3. Record Linkage</text><text class="s" x="800" y="634">linkage.py (precision-first F0.5)</text>
+
+<circle cx="1120" cy="300" r="36" fill="#7c3aed"/><use href="#plan" transform="translate(1120 300)"/>
+<text class="n" x="1120" y="236">4. Adaptive Privacy Planner</text><text class="s" x="1120" y="252">planner.py · policy.yaml</text>
+
+<circle cx="1120" cy="560" r="36" fill="#475569"/><use href="#key" transform="translate(1120 560)"/>
+<text class="n" x="1120" y="618">RAKSHA_SECRET</text><text class="s" x="1120" y="634">RAM only</text>
+
+<circle cx="1440" cy="300" r="36" fill="#059669"/><use href="#redact" transform="translate(1440 300)"/>
+<text class="n" x="1440" y="358">5. Pass 2: Shielded Redaction</text><text class="s" x="1440" y="374">detector.py · ner_crf.py</text>
+
+<circle cx="480" cy="600" r="36" fill="#dc2626"/><use href="#vault" transform="translate(480 600)"/>
+<text class="n" x="530" y="594" style="text-anchor:start">Ephemeral Vault</text><text class="s" x="530" y="610" style="text-anchor:start">security.py</text>
+</g>
+
+<!-- OUTPUTS -->
+<text x="1800" y="62" font-size="13" font-weight="800" fill="#64748b" text-anchor="middle" letter-spacing="1">VERIFIED RELEASE OUTPUT</text>
+<g>
+<circle cx="1800" cy="140" r="34" fill="#16a34a"/><use href="#clean" transform="translate(1800 140)"/>
+<text class="n" x="1800" y="195">sanitized/</text><text class="s" x="1800" y="211">UTF-8 export · FHIR bundles</text>
+<circle cx="1800" cy="300" r="34" fill="#2563eb"/><use href="#json" transform="translate(1800 300)"/>
+<text class="n" x="1800" y="355">records.jsonl</text><text class="s" x="1800" y="371">per-unit file · PSN tokens</text>
+<circle cx="1800" cy="460" r="34" fill="#475569"/><use href="#bars" transform="translate(1800 460)"/>
+<text class="n" x="1800" y="515">report.json</text><text class="s" x="1800" y="531">sha256 · counts · timing</text>
+<circle cx="1800" cy="640" r="34" fill="#dc2626"/><use href="#quar" transform="translate(1800 640)"/>
+</g>
+<text class="n" x="1842" y="636" style="text-anchor:start">quarantine/*.enc</text><text class="s" x="1842" y="652" style="text-anchor:start">encrypted, unsupported files</text>
+
+<!-- LEGEND -->
+<g font-size="12" fill="#475569">
+<path d="M60 758H100" stroke="#334155" stroke-width="2.5" marker-end="url(#a)"/><text x="108" y="762">data flow</text>
+<path d="M200 758H240" stroke="#dc2626" stroke-width="2.5" stroke-dasharray="7 5"/><text x="248" y="762">quarantine</text>
+<path d="M340 758H380" stroke="#7c3aed" stroke-width="2.5" stroke-dasharray="7 5"/><text x="388" y="762">cross-pass</text>
+</g>
+<metadata><c2pa:manifest>AAAWgmp1bWIAAAAeanVtZGMycGEAEQAQgAAAqgA4m3EDYzJwYQAAABZcanVtYgAAAEdqdW1kYzJtYQARABCAAACqADibcQN1cm46YzJwYTo1MDNmNzZhZC01OTliLTQzMmUtODIxZS02YzQzODI4ZjA2ODAAAAADl2p1bWIAAAApanVtZGMyYXMAEQAQgAAAqgA4m3EDYzJwYS5hc3NlcnRpb25zAAAAALxqdW1iAAAARGp1bWRjYm9yABEAEIAAAKoAOJtxE2MycGEuaW5ncmVkaWVudC52MwAAAAAYYzJzaKZyTRqOW/O6l8GWVYpV5cIAAABwY2JvcqNpZGM6Zm9ybWF0bWltYWdlL3N2Zyt4bWxqaW5zdGFuY2VJRHgseG1wOmlpZDoyNDA3ZWJkNy0wMGFhLTRjNWEtOTQwMy02MmQ3YjkwYzBlY2RscmVsYXRpb25zaGlwaHBhcmVudE9mAAAB4mp1bWIAAABBanVtZGNib3IAEQAQgAAAqgA4m3ETYzJwYS5hY3Rpb25zLnYyAAAAABhjMnNoK2TFIO6+LHiHZL+irYYRDgAAAZljYm9yomdhY3Rpb25zgqJmYWN0aW9ua2MycGEub3BlbmVkanBhcmFtZXRlcnOha2luZ3JlZGllbnRzgaJjdXJseC1zZWxmI2p1bWJmPWMycGEuYXNzZXJ0aW9ucy9jMnBhLmluZ3JlZGllbnQudjNkaGFzaFggb8yzvRA5tJvcUlSjsHykw8sI5xVmJjxm48cW+pbuRJqkZmFjdGlvbngdY29tLmFudGhyb3BpYy5jbGF1ZGUucHJvdmlkZWRqcGFyYW1ldGVyc6F4H2NvbS5hbnRocm9waWMub3JpZ2luLWNvbmZpZGVuY2VndW5rbm93bmtkZXNjcmlwdGlvbnhmQ2xhdWRlIHByb3ZpZGVkIHRoaXMgZmlsZSBhdCB0aGUgcmVxdWVzdCBvZiBhIHVzZXIgYW5kIG1heSBoYXZlIGNyZWF0ZWQgb3IgbW9kaWZpZWQgdGhlIGZpbGUgY29udGVudHMubXNvZnR3YXJlQWdlbnShZG5hbWVmQ2xhdWRlcmFsbEFjdGlvbnNJbmNsdWRlZPUAAADIanVtYgAAAEBqdW1kY2JvcgARABCAAACqADibcRNjMnBhLmhhc2guZGF0YQAAAAAYYzJzaMx9lUVpHAmtRw6JgvCTJjkAAACAY2JvcqVjYWxnZnNoYTI1NmNwYWRMAAAAAAAAAAAAAAAAZGhhc2hYIJwXPLXTkhpuaZ3g4UWRNQbs6b48IHEhgcgMgBNRFg+oZG5hbWVuanVtYmYgbWFuaWZlc3RqZXhjbHVzaW9uc4GiZXN0YXJ0GSMbZmxlbmd0aBkeBAAAAj5qdW1iAAAAJ2p1bWRjMmNsABEAEIAAAKoAOJtxA2MycGEuY2xhaW0udjIAAAACD2Nib3KlY2FsZ2ZzaGEyNTZpc2lnbmF0dXJleE1zZWxmI2p1bWJmPS9jMnBhL3VybjpjMnBhOjUwM2Y3NmFkLTU5OWItNDMyZS04MjFlLTZjNDM4MjhmMDY4MC9jMnBhLnNpZ25hdHVyZWppbnN0YW5jZUlEeCx4bXA6aWlkOjRiNzc2NDkyLTFjMjQtNGVlNC1iZGExLWY5NTYxNDlmMmFmZnJjcmVhdGVkX2Fzc2VydGlvbnODomN1cmx4LXNlbGYjanVtYmY9YzJwYS5hc3NlcnRpb25zL2MycGEuaW5ncmVkaWVudC52M2RoYXNoWCBvzLO9EDm0m9xSVKOwfKTDywjnFWYmPGbjxxb6lu5EmqJjdXJseCpzZWxmI2p1bWJmPWMycGEuYXNzZXJ0aW9ucy9jMnBhLmFjdGlvbnMudjJkaGFzaFggrlAqnQrF9DM7fA260ktu2QOdna0PenEV45CfdfaSrViiY3VybHgpc2VsZiNqdW1iZj1jMnBhLmFzc2VydGlvbnMvYzJwYS5oYXNoLmRhdGFkaGFzaFgg6orkzEXcV2FfHFBVnm46s/GivFU4t2QgXkJ1PHRIgZV0Y2xhaW1fZ2VuZXJhdG9yX2luZm+jZG5hbWVvQW50aHJvcGljIEZpbGVzZ3ZlcnNpb25lMS4wLjBrc3BlY1ZlcnNpb25lMi40LjAAABA4anVtYgAAAChqdW1kYzJjcwARABCAAACqADibcQNjMnBhLnNpZ25hdHVyZQAAABAIY2JvctKEWQISogEmGCFZAgowggIGMIIBjaADAgECAhRA5aAK7sI50L64g/oGQgU9Z1UTADAKBggqhkjOPQQDAzBJMRcwFQYDVQQKEw5BbnRocm9waWMsIFBCQzEuMCwGA1UEAxMlQW50aHJvcGljIENvbnRlbnQgQ3JlZGVudGlhbHMgUm9vdCBDQTAeFw0yNjA4MDcxODQzNTZaFw0yODA4MDYxOTQzNTZaMEQxFzAVBgNVBAoTDkFudGhyb3BpYywgUEJDMSkwJwYDVQQDEyBBbnRocm9waWMgQ2xhdWRlIENvbnRlbnQgU2lnbmluZzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJh6CmvLUBgFFNU0vUKlOVtE6djd17L5SuwX0LemFisBM3dkd/3cyjxFA3Qo5S46fX0/ihY0VZ7mfb9KF703t5OjWDBWMA4GA1UdDwEB/wQEAwIHgDAVBgNVHSUEDjAMBgorBgEEAYPoXgIBMAwGA1UdEwEB/wQCMAAwHwYDVR0jBBgwFoAUzlHiBIFOZFsj+OPEz5o+nMHXXMIwCgYIKoZIzj0EAwMDZwAwZAIwMXMdFJ4BetLLVY7ORuE9noqbbAZOZn/aArXyTwFAZfKrPzxF2vPoJNf1+UCdg1XGAjBwX1zd9WGqYkqmL5SFqw1QySjr1zJfpJM9+1rdDwSPLMOPOjKuiXjoU/pUUeG9RwmhY3BhZFkNngAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPZYQKR7Q8hBBECG10AWpltAjHRb1NloEfBzc42d8eeuc033dyXiHbpNOOO8ta7qv61enfD+q7qmKrxhGrfGXyA+0Io=</c2pa:manifest></metadata></svg>
