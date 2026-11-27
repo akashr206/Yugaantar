@@ -1,10 +1,16 @@
 """Multilingual & context-aware PII detector with meaning-trap shields."""
 from __future__ import annotations
 
+import base64
+import binascii
+import html
 import re
+import urllib.parse
 from dataclasses import dataclass, field
 
 from rakshak.contracts import PrivacyPlan
+from rakshak.ner_crf import tag_unanchored_person_spans
+from rakshak.translit import fold_homoglyphs, is_valid_verhoeff
 from rakshak.schema_profiler import (
     ROLE_AADHAAR,
     ROLE_ABHA,
@@ -83,15 +89,17 @@ _SHIELD_PATTERNS: list[re.Pattern[str]] = [
     # ASHA workers & hospital wards with clinical department
     re.compile(r"(?i)\bASHA[ \t]+workers?\b"),
     re.compile(r"(?i)\bWard[ \t]+\d+[ \t]*\([^)\n]+\)(?:[ \t]*/[ \t]*Bed[ \t]*\d+)?"),
-    # Hospital names
+    # Generic hospital / lab / facility names (without hardcoding dev facility names)
     re.compile(
-        r"(?i)\b(?:Sanjeevani[ \t]+Multispeciality[ \t]+Hospital|Jeevan[ \t]+Jyoti[ \t]+Charitable[ \t]+Hospital|"
-        r"Arogya[ \t]+Seva[ \t]+Sadan|District[ \t]+Hospital[ \t]+Hardoi|Lifeline[ \t]+Pathology|"
-        r"Pathkind[ \t]+Labs(?:[ \t]*\([^)\n]+\))?|City[ \t]+Diagnostics|Sanjeevani[ \t]+In-house[ \t]+Lab)\b"
+        r"\b(?:[A-Z][a-zA-Z.'-]{1,25}[ \t]+){0,4}"
+        r"(?:Multispeciality[ \t]+Hospital|Charitable[ \t]+Hospital|District[ \t]+Hospital|Medical[ \t]+College|"
+        r"Health[ \t]+Cent(?:er|re)|In-house[ \t]+Lab|Hospital|Pathology|Diagnostics|Labs?|Clinic|Sadan)"
+        r"(?:[ \t]+(?:[A-Z][a-zA-Z.'-]{1,25}|Lab|Centre|Center)){0,2}"
+        r"(?:[ \t]*\([^)\n]{1,40}\))?"
     ),
     # Medications, doses, frequencies, vitals, labs, ranges
     re.compile(r"(?i)\b(?:Tab\.?|Cap\.?|Inj\.?|Syp\.?|Drops|Oint\.?)[ \t]+[^\n;]+"),
-    re.compile(r"(?i)\bDolo[ \t]+650(?:[ \t]+(?:OD|BD|TDS|QID))?(?:[ \t]*x[ \t]*\d+[ \t]*(?:days?|wks?|weeks?))?"),
+    re.compile(r"\b[A-Z][a-zA-Z-]{2,}[ \t]+\d{1,4}[ \t]+(?:OD|BD|TDS|QID|HS|SOS|STAT)\b(?:[ \t]*x[ \t]*\d+[ \t]*(?:days?|wks?|weeks?|months?))?"),
     re.compile(r"\b[0-2]-[0-2]-[0-2]\b(?:[ \t]*x[ \t]*\d+[ \t]*(?:days?|wks?|weeks?|months?))?"),
     re.compile(r"(?i)\b\d+(?:\.\d+)?[ \t]*(?:mg/dL|g/dL|mg|mcg|ug|gm|g|mL|ml|IU|/uL|mmHg|U/L|mIU/L|°F)\b"),
     re.compile(r"(?i)\b(?:BP[ \t]*\d{2,3}/\d{2,3}|Pulse[ \t]*\d{2,3}(?:/min)?|SpO2[ \t]*\d{2,3}%|Temp[ \t]*\d{2,3}(?:\.\d+)?[ \t]*°?F)\b"),
@@ -100,35 +108,68 @@ _SHIELD_PATTERNS: list[re.Pattern[str]] = [
         r"\d{1,6}(?:\.\d+)?-\d{1,6}(?:\.\d+)?(?![A-Za-z0-9.\-])"
     ),
     re.compile(r"(?i)\b(?:x[ \t]*\d+[ \t]*(?:days?|wks?|weeks?|months?|yrs?)|for[ \t]+\d+[ \t]+(?:days?|wks?|weeks?|months?|yrs?))\b"),
-    # ICD-10 and package codes
-    re.compile(r"\b[A-TV-Z]\d{2}(?:\.\d{1,2})?\b"),
-    re.compile(r"\b(?:SG|MG)\d{3}[A-Z]\b"),
+    # ICD-10 (including U07.1 COVID-19) and generic PMJAY package codes
+    re.compile(r"\b[A-Z]\d{2}(?:\.\d{1,2})?\b"),
+    re.compile(r"\b[A-Z]{2}\d{3}[A-Z]\b"),
 ]
 
 # --------------------------------------------------------------------------- Stage 2: Direct IDs
 _DIRECT_ID_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("ABHA_ADDRESS", re.compile(r"[\w.+-]+@(?:abdm|sbx)\b", re.I)),
+    ("ABHA_ADDRESS", re.compile(r"[\w.+-]+@(?:abdm|sbx|ndhm|phr|nha)\b", re.I)),
     ("EMAIL", re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")),
-    ("UPI_ID", re.compile(r"\b[\w.+-]{2,}@(?:ok(?:icici|hdfcbank|axisbank|sbi)|ybl|ibl|axl|paytm|upi)\b", re.I)),
-    ("ABHA_NUMBER", re.compile(r"(?<!\d)91[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}(?!\d)")),
-    ("AADHAAR_MASKED", re.compile(r"(?i)(?<![A-Za-z0-9])[X*]{4}[\s-]?[X*]{4}[\s-]?\d{4}(?!\d)")),
-    ("AADHAAR", re.compile(r"(?<!\d)(?:\(\d{4}\)|\d{4})[\s-]?\d{4}[\s-]?\d{4}(?!\d)")),
-    ("PHONE", re.compile(r"(?<!\d)(?:\+?91[\s-]?)?0?[6-9]\d{4}[\s-]?\d{5}(?!\d)")),
+    (
+        "UPI_ID",
+        re.compile(
+            r"\b[\w.+-]{2,}@(?:ok(?:axis|icici|hdfcbank|axisbank|sbi)|"
+            r"icici|hdfc\w*|sbi|axis\w*|kotak|ybl|ibl|axl|paytm|upi|apl|yapl|rapl|"
+            r"pingpay|jio|fampay|aubank|idfc\w*|indus|yes\w*|federal|airtel|freecharge|"
+            r"amazonpay|hsbc|barodampay|pnb|bob|boi|canara|union|wa(?:icici|axis|hdfc|sbi))\b",
+            re.I,
+        ),
+    ),
+    (
+        "ABHA_NUMBER",
+        re.compile(
+            r"(?<!\d\.)(?<!\d)(?:(?!00)\d{2}[-\s.]\d{4}[-\s.]\d{4}[-\s.]\d{4}|"
+            r"(?!00)(?!20\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))\d{14})(?!\d)"
+        ),
+    ),
+    ("AADHAAR_MASKED", re.compile(r"(?i)(?<![A-Za-z0-9])(?:\([X*]{4}\)|[X*]{4})[\s.-]?[X*]{4}[\s.-]?\d{4}(?!\d)")),
+    ("AADHAAR", re.compile(r"(?<!\d\.)(?<!\d)(?:\(\d{4}\)|\d{4})[\s.-]\d{4}[\s.-]\d{4}(?!\d)")),
+    ("AADHAAR_LBL", re.compile(r"(?i)(?:\b(?:Aadhaar|Aadhar|UID|UIDAI|आधार)(?:[ \t]*(?:No\.?|Num(?:ber)?|ID))?[ \t]*[:=\-#][ \t]*)(\d{12})(?!\d)")),
+    (
+        "PHONE",
+        re.compile(
+            r"(?<!\d\.)(?<!\d)(?:(?:\(\+?91\)|\+?91|0091|0)[\s.-]?)?[6-9]\d{2}(?:[\s.-]?\d{3}[\s.-]?\d{4}|[\s.-]?\d{2}[\s.-]?\d{5}|\d{7})(?!\d)"
+        ),
+    ),
+    ("PHONE", re.compile(r"(?<!\d\.)(?<!\d)0\d{2,4}[-.\s]\d{6,8}(?!\d)")),
     ("PAN", re.compile(r"(?i)\b[A-Z]{5}[ \t]?\d{4}[ \t]?[A-Z]\b")),
-    ("INSURANCE_ID", re.compile(r"\b(?:PMJAY-[A-Z]{2}-\d+|POL/\d+/\d+)\b")),
+    (
+        "INSURANCE_ID",
+        re.compile(
+            r"\b(?:(?:PMJAY|CGHS|ECHS|RSBY|TPA|POL|CLAIM|INS)[/_-][A-Z0-9]{2,}(?:[/_-]\d+)*|POL/\d+/\d+)\b",
+            re.I,
+        ),
+    ),
     (
         "MRN",
         re.compile(
-            r"(?i)\b(?:SNJ/\d{2}/\d+|JJH-\d+|UHID-\d+|DHH\d{4}-\d+|DHH-IPD-\d+|"
-            r"IPD-\d{4}-\d+|IP/\d{2}/\d+|ADM\d{4,}|BL/\d{2}/\d+|OPD/\d{2}/\d{2}/\d+)\b"
+            r"(?i)\b(?!(?:OPD|POL|PMJAY|CGHS|ECHS|COVID|SARS|HIV|HBV|HCV|CD|IL|VIT|ICD|LOINC|SNOMED|TAB|CAP|INJ|SYP|"
+            r"JAN|JANUARY|FEB|FEBRUARY|MAR|MARCH|APR|APRIL|MAY|JUN|JUNE|JUL|JULY|AUG|AUGUST|SEP|SEPT|SEPTEMBER|OCT|OCTOBER|NOV|NOVEMBER|DEC|DECEMBER)\b)"
+            r"(?:[A-Z]{2,6}(?:\d{2,4})?[/_-]\d{2,4}[/_-]\d{3,8}|[A-Z]{1,6}(?:\d{2,4})?[-_/#]\d{4,10}|"
+            r"20\d{2}[/_-][A-Z]{2,6}[/_-]\d{3,8}|(?:ADM|UHID|MRN|PID|REG)\d{4,9})\b"
         ),
     ),
 ]
 
-# Labeled ID fallback for unseen hospital prefixes (group 2 = ID value)
+# Compositional labeled ID fallback for unseen hospital/policy/chart/ref prefixes (group 2 = ID value, must contain a digit)
 _LABELED_ID_RX = re.compile(
-    r"(?i)((?:UHID|IPD\s*No\.?|Reg\.?\s*No\.?|Patient\s*No\.?|NHS\s*No\.?|MRN|Patient\s*ID|पंजीकरण\s*सं\.?|आईपीडी\s*सं\.?)[:\s]\s*)"
-    r"([A-Za-z0-9/_-]{4,24}|\d{3,4}[ \t]\d{3,4}[ \t]\d{3,4})"
+    r"(?i)((?:(?:UHID|MRN|IPD|OPD|PID|UID|ADM|NHS|ABDM|ABHA|Health|Patient|Pt\.?|Reg(?:n|\.?)|Registration|"
+    r"Case|Chart|File|Episode|Bill|Claim|Policy|Member|Subscriber|Beneficiary|Card|Token|Ticket|Account|Ref(?:erence)?)"
+    r"(?:[ \t]+(?:No\.?|Num(?:ber)?|ID|Code|Ref|#))?|पंजीकरण[ \t]+सं\.?|आईपीडी[ \t]+सं\.?|पॉलिसी[ \t]+सं\.?|मरी[ज़ज][ \t]+सं\.?)"
+    r"(?:[ \t]*:[ \t]*|[ \t]*[=#|][ \t]*|[ \t]+-[ \t]+))"
+    r"(?=[A-Za-z0-9/_#-]*\d|[ \t0-9]+\d)([A-Za-z0-9/_#-]{4,26}|\d{3,4}[ \t]\d{3,4}[ \t]\d{3,4})"
 )
 
 # --------------------------------------------------------------------------- Stage 3: Context-Anchored Names & Addresses
@@ -139,44 +180,84 @@ _HONORIFICS = (
 
 # Tuple: (entity_kind, regex, capture_group_index_to_redact)
 _LABELED_NAME_PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
-    # Patient labels (Latin) - stop before double space or Age/Sex/UHID/IPD
+    # Compositional Patient / Subject labels (Latin) - supports :, =, |, and " - " delimiters on explicit Name labels
     (
         "PATIENT_NAME",
         re.compile(
-            r"(?im)((?:Patient\s*Name|Pt\.?\s*Name|Applicant\s*Name|Account\s*Holder|Beneficiary(?:\s*Name)?|Name)\s*:\s*)"
-            r"([^\n,;|()]+?)(?=\s{2,}(?:Age|Sex|UHID|IPD|Reg|Mobile|Mob)|\s*(?:Age/Sex|Age|UHID|IPD)\s*:|\n|$)"
+            r"(?im)(?<!Panel[ \t])(?<!Test[ \t])(?<!Drug[ \t])(?<!Lab[ \t])(?<!Hospital[ \t])(?<!Facility[ \t])(?<!Doctor[ \t])(?<!Department[ \t])(?<!Consultant[ \t])(?<!Physician[ \t])"
+            r"((?:(?:Patient|Pt\.?|Subject|Client|Applicant|Account|Subscriber|Beneficiary|Member|Claimant|Insured|Person|Payee|Issued[ \t]+to|Examined[ \t]+for)"
+            r"(?:[ \t]+(?:Full|Legal|First|Last|Display|Registered|Primary))?[ \t]+Name|(?:Full|Legal|Display)[ \t]+Name|Name)"
+            r"(?:[ \t]*:[ \t]*|[ \t]*[=|][ \t]*|[ \t]+-[ \t]+)|"
+            r"(?:Patient|Pt\.?|Subject|Client|Subscriber|Beneficiary|Member|Claimant|Payee|Issued[ \t]+to|Examined[ \t]+for)[ \t]*[:=][ \t]*)"
+            r"([^\n,;|()]+?)(?=\s+(?:Age/Sex|Age|Sex|DOB|Birth|Date|Phone|Mob|Mobile|Tel|Aadhaar|ABHA|Gender|Address|UHID|IPD|MRN|Reg)\b|\s*(?:Age/Sex|Age|DOB|UHID|IPD|MRN)\s*[:=\-]|\n|$)"
         ),
         2,
     ),
-    # Patient labels (Devanagari)
+    # Compositional Patient labels (Devanagari)
     (
         "PATIENT_NAME",
         re.compile(
-            r"(?m)((?:मरीज़\s+का\s+नाम|रोगी\s+का\s+नाम|नाम)\s*:\s*)"
-            r"([^\n,;|()]+?)(?=\s{2,}|\s*(?:आयु|उम्र|लिंग|पता|मोबाइल)\s*:|\n|$)"
+            r"(?m)((?:मरी[ज़ज][ \t]*(?:का[ \t]+नाम)?|रोगी[ \t]*(?:का[ \t]+नाम)?|अभ्यर्थी[ \t]*(?:का[ \t]+नाम)?|नाम)"
+            r"(?:[ \t]*:[ \t]*|[ \t]*[=|][ \t]*|[ \t]+-[ \t]+))"
+            r"([^\n,;|()]+?)(?=\s{2,}|\s+(?:आयु|उम्र|लिंग|पता|मोबाइल|जन्म)\b|\s*(?:आयु|उम्र|लिंग|पता|मोबाइल)\s*[:=\-]|\n|$)"
         ),
         2,
     ),
-    # Relative labels (Devanagari)
+    # Compositional Relative / Kin / Caregiver labels (Devanagari & English)
     (
         "RELATIVE_NAME",
-        re.compile(r"(?m)((?:पिता[ \t]+का[ \t]+नाम|पति[ \t]+का[ \t]+नाम|अभिभावक(?:[ \t]+का[ \t]+नाम)?)[ \t]*:[ \t]*)([^\n,;|()]+)"),
+        re.compile(
+            r"(?im)((?:पिता[ \t]+का[ \t]+नाम|पति[ \t]+का[ \t]+नाम|अभिभावक(?:[ \t]+का[ \t]+नाम)?|"
+            r"(?:Father|Mother|Husband|Wife|Spouse|Guardian|Attendant|Caregiver|Emergency[ \t]+Contact|Nominee|Next[ \t]+of[ \t]+Kin|Kin|Relative|Witness)"
+            r"(?:(?:'s)?[ \t]+(?:Full[ \t]+)?Name)?)(?:[ \t]*:[ \t]*|[ \t]*[=|][ \t]*|[ \t]+-[ \t]+))([^\n,;|()]+)"
+        ),
         2,
     ),
-    # Relation markers (S/o, D/o, W/o, C/O <person>) - horizontal spaces only!
+    # Relation markers (S/o, D/o, W/o, C/O <person>) - support mixed/lowercase too
     (
         "RELATIVE_NAME",
         re.compile(
             r"(?m)(\b(?:S/o|D/o|W/o|C/o|S/O|D/O|W/O|C/O)[ \t]+)"
-            r"([A-Z][a-zA-Z.'-]*(?:[ \t]+[A-Z][a-zA-Z.'-]*){0,3}|[\u0900-\u097F]+(?:[ \t]+[\u0900-\u097F]+){0,2})"
+            r"([A-Za-z][a-zA-Z.'-]*(?:[ \t]+[A-Za-z][a-zA-Z.'-]*){0,3}|[\u0900-\u097F]+(?:[ \t]+[\u0900-\u097F]+){0,2})"
         ),
         2,
     ),
-    # Attendant explicit label
+    # Attendant / Guardian / Nominee explicit label
     (
         "RELATIVE_NAME",
-        re.compile(r"(?m)(Attendant:[ \t]*)([A-Z][a-zA-Z.'-]+(?:[ \t]+[A-Z][a-zA-Z.'-]+){0,3})"),
+        re.compile(
+            r"(?im)((?:Attendant|Guardian|Nominee|Next[ \t]+of[ \t]+kin)[ \t]*:[ \t]*)"
+            r"([A-Za-z][a-zA-Z.'-]+(?:[ \t]+[A-Za-z][a-zA-Z.'-]+){0,3}|[\u0900-\u097F]+(?:[ \t]+[\u0900-\u097F]+){0,2})"
+        ),
         2,
+    ),
+    # Relation prefix without colon ("Wife Priya Chaturvedi", "Father Debashis Mahapatra", "परिजन Pema Bhutia")
+    (
+        "RELATIVE_NAME",
+        re.compile(
+            r"(?m)(?:^|(?<=[\s(\[.,;]))((?:Wife|Husband|Father|Mother|Spouse|Attendant|Guardian|Nominee)[ \t]+)"
+            r"(?!(?:of|to|for|from|in|on|at|with|was|had|is|are|reported|died|verified|signed)\b)"
+            r"([A-Z][a-zA-Z.'-]+(?:[ \t]+(?!(?:and|or|on|at|in|for|to|of|from|phone|mob|mobile|District|PIN)\b)[A-Z][a-zA-Z.'-]+){0,3})"
+        ),
+        2,
+    ),
+    (
+        "RELATIVE_NAME",
+        re.compile(
+            r"(?m)((?:परिजन|पत्नी|पति|पिता|माता|अभिभावक)[ \t]+)"
+            r"([A-Z][a-zA-Z.'-]+(?:[ \t]+(?!(?:and|or|on|at|in|for|to|of|from|phone)\b)[A-Z][a-zA-Z.'-]+){0,3}|[\u0900-\u097F]{2,}(?:[ \t]+[\u0900-\u097F]{2,}){0,2})"
+            r"(?=[ \t]+(?:ने|को|का|की|के|से)\b|[ \t]*[,।\n]|$)"
+        ),
+        2,
+    ),
+    # Patient opening "<Full Name>, <age> yrs" in clinical summaries
+    (
+        "PATIENT_NAME",
+        re.compile(
+            r"(?m)^([A-Z][a-zA-Z.'-]+(?:[ \t]+[A-Z][a-zA-Z.'-]+){1,3})"
+            r"(?=[ \t]*,[ \t]*\d{1,3}[ \t]*(?:yrs?|years?|y/[MFO]))"
+        ),
+        1,
     ),
     # Possessive patient mention ("Asha's attendant")
     (
@@ -243,10 +324,14 @@ _LABELED_NAME_PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
         re.compile(r"(?:श्री|श्रीमती|सुश्री)[ \t]+([^\s,;|()।\n]+(?:[ \t]+[^\s,;|()।\n]+){0,2})"),
         0,
     ),
-    # Hinglish honorific phrases ("Shahid sahab", "Asha ji", "Reena behenji", "Ashok bhai", "Shahid babu", "Zainab amma")
+    # Hinglish honorific phrases ("Shahid sahab", "Asha ji", "ramesh bhai") avoiding prepositions ("of Jaspreet babu")
     (
         "PATIENT_NAME",
-        re.compile(rf"\b([A-Z][a-zA-Z.'-]+(?:[ \t]+[A-Z][a-zA-Z.'-]+)?[ \t]+(?i:{_HONORIFICS}))\b"),
+        re.compile(
+            rf"\b(?!(?:of|for|by|to|from|in|on|at|the|and|with|report|patient|doctor|dr)\b)"
+            rf"([A-Za-z][a-zA-Z.'-]{{1,}}(?:[ \t]+(?!(?:of|for|by|to|from|in|on|at|the|and|with)\b)[A-Za-z][a-zA-Z.'-]{{1,}})?[ \t]+(?i:{_HONORIFICS}))\b",
+            re.I,
+        ),
         1,
     ),
     # Hinglish subject before postposition ("Ashok ka BP", "Dinesh ko bukhar") excluding generic non-name nouns
@@ -258,10 +343,10 @@ _LABELED_NAME_PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
         ),
         1,
     ),
-    # Hindi narrative sentence subject "<Name> को <N> दिन से"
+    # Hindi narrative sentence subject "<Name> को <duration/symptom>"
     (
         "PATIENT_NAME",
-        re.compile(r"([\u0900-\u097F]{2,}(?:[ \t]+[\u0900-\u097F]{2,}){1,2})(?=[ \t]+को[ \t]+\d+[ \t]+दिन[ \t]+से)"),
+        re.compile(r"([\u0900-\u097F]{2,}(?:[ \t]+[\u0900-\u097F]{2,}){1,2})(?=[ \t]+को[ \t]+(?:\d+[ \t]*(?:दिन|हफ्ते|सप्ताह|माह|साल)|तेज|कल|बुखार|दर्द))"),
         1,
     ),
 ]
@@ -270,31 +355,35 @@ _ADDRESS_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("HOUSE", re.compile(r"(?im)\b(?:H\.?[ \t]*No\.?|House(?:[ \t]+No\.?)?|Makan[ \t]+No\.?)[: \t]*[A-Za-z0-9/-]+")),
     ("HOUSE", re.compile(r"(?m)मकान[ \t]+नं\.?[: \t]*\d+[A-Za-z0-9/-]*")),
     ("LOCALITY", re.compile(r"(?im)\bWard[ \t]+\d+\b(?![ \t]*\()")),
-    ("LOCALITY", re.compile(r"(?im)\bMohalla[: \t]+[^,\n-]+?(?=,|[ \t]+(?:near|opp|behind|Vill|Gram|Tehsil|Distt)|$)")),
-    ("LOCALITY", re.compile(r"(?m)मोहल्ला[: \t]+[^,\n-]+?(?=,|[ \t]+(?:तहसील|जिला|ग्राम|के[ \t]+पास|के[ \t]+पीछे|के[ \t]+सामने)|$)")),
-    ("LANDMARK", re.compile(r"(?im)\b(?:near|opp\.?|opposite|behind)[ \t]+[^,\n-]+?(?=,|[ \t]+(?:Vill|Gram|Tehsil|Distt)|$)")),
+    ("LOCALITY", re.compile(r"(?im)\bMohalla[: \t]+[^,\n-]+?(?=,|[ \t]+(?:near|opp|behind|Vill|Gram|Tehsil|Distt|District|PIN)|$)")),
+    ("LOCALITY", re.compile(r"(?m)मोहल्ला[: \t]+[^,\n-]+?(?=,|[ \t]+(?:तहसील|जिला|जनपद|ग्राम|के[ \t]+पास|के[ \t]+पीछे|के[ \t]+सामने)|$)")),
+    ("LANDMARK", re.compile(r"(?im)\b(?:near|opp\.?|opposite|behind)[ \t]+[^,\n-]+?(?=,|[ \t]+(?:Vill|Gram|Tehsil|Distt|District|PIN)|$)")),
     ("LANDMARK", re.compile(r"(?m)[^\s,।]+(?:[ \t]+[^\s,।]+){0,3}[ \t]+के[ \t]+(?:पास|पीछे|सामने)")),
-    ("VILLAGE", re.compile(r"(?im)\b(?:Vill\.?|Village|Gram)[: \t]+[^,\n-]+?(?=,|[ \t]+(?:Tehsil|Distt|PIN)|$)")),
-    ("VILLAGE", re.compile(r"(?m)ग्राम[: \t]+[^,\n-]+?(?=,|[ \t]+(?:तहसील|जिला)|$)")),
-    ("TEHSIL", re.compile(r"(?im)\bTehsil[: \t]+[^,\n-]+?(?=,|[ \t]+(?:Distt|PIN)|$)")),
-    ("TEHSIL", re.compile(r"(?m)तहसील[: \t]+[^,\n-]+?(?=,|[ \t]+जिला|$)")),
-    # Street / lane / road / marg / gali / sector addresses (case-sensitive capitalized words, guarding clinical/hospital terms)
+    ("VILLAGE", re.compile(r"(?im)\b(?:Vill\.?|Village|Gram)[: \t]+[^,\n-]+?(?=,|[ \t]+(?:Tehsil|Block|Mandal|Taluka|Distt|District|PIN)|$)")),
+    ("VILLAGE", re.compile(r"(?m)ग्राम[: \t]+[^,\n-]+?(?=,|[ \t]+(?:तहसील|ब्लॉक|जिला|जनपद|पिन)|$)")),
+    ("TEHSIL", re.compile(r"(?im)\b(?:Tehsil|Taluka|Block|Mandal)[: \t]+[^,\n-]+?(?=,|[ \t]+(?:Distt|District|PIN)|$)")),
+    ("TEHSIL", re.compile(r"(?m)(?:तहसील|ब्लॉक)[: \t]+[^,\n-]+?(?=,|[ \t]+(?:जिला|जनपद|पिन)|$)")),
+    # Street / lane / road / marg / gali / sector addresses (guard clinical/hospital nouns generically)
     (
         "LOCALITY",
         re.compile(
             r"(?m)\b(?:(?i:Lane|Street|St\.?|Sector|Phase|Block|Gali)[ \t]+[A-Za-z0-9][A-Za-z0-9 .'-]{1,30}|"
-            r"(?!(?:Hospital|Medical|Clinic|College|Sanjeevani|Arogya|Jeevan|District)\b)"
+            r"(?!(?:Hospital|Medical|Clinic|College|District|Labs?|Pathology|Diagnostics|Health|Trust|Centre|Center)\b)"
             r"[A-Z][A-Za-z0-9.'-]*(?:[ \t]+[A-Z][A-Za-z0-9.'-]*){0,2}[ \t]+(?:Road|Rd\.?|Marg|Lane|Street|St\.?|Gali|Chowk|Nagar|Vihar|Enclave|Colony))\b"
         ),
     ),
 ]
 
-_PIN_IN_ADDRESS_RX = re.compile(r"(?:-\s|PIN[:\s]\s*|Distt\.\s[A-Za-z\s]{3,25})(\b[1-8]\d{5}\b)")
-_STANDALONE_PIN_RX = re.compile(r"(?:^|[-\s,])([1-8]\d{5})(?=\s*$|\s*[,\n])", re.M)
+_PIN_IN_ADDRESS_RX = re.compile(
+    r"(?i)(?:-\s|(?:PIN(?:\s*Code)?|Postal\s*Code|Zip|पिन(?:\s*कोड)?)[:\s-]\s*|(?:Distt?\.?|District|ghar|vill\.?|village|gram|tehsil|taluka|road|marg|nagar)\s+[A-Za-z\s,]{2,30}|(?:जिला|जनपद)\s*[:.]?\s*[\u0900-\u097F\s,]{2,25})(\b[1-8]\d{5}\b)"
+)
+_STANDALONE_PIN_RX = re.compile(r"(?:^|[-\s,])([1-8]\d{5})(?=\s*$|\s*[.,\n])", re.M)
 
-_FREE_AGE_EN_RX = re.compile(r"(?i)(\bAge/Sex:\s*|\bAge:\s*)(\d{1,3})(\s*(?:Yrs?|Years?)?(?:/[MFO])?)\b")
-_FREE_AGE_WA_RX = re.compile(r"(?i)(Report of \[PATIENT_NAME\]\s+)(\d{1,3})(\s*Y\s*/\s*[MFO])")
-_FREE_AGE_HI_RX = re.compile(r"(आयु:\s*)(\d{1,3})(\s*वर्ष(?:\s*/\s*(?:पुरुष|महिला|अन्य))?)")
+_FREE_AGE_EN_RX = re.compile(
+    r"(?i)(\b(?:Age/Sex|Age|Umar|Umra|Vayas)\s*[:=\-]\s*)(\d{1,3})(\s*(?:Yrs?|Years?|Y)?(?:\s*/\s*(?:Male|Female|[MFO]))?)\b"
+)
+_FREE_AGE_WA_RX = re.compile(r"(\b)(\d{1,3})(\s*Y(?:rs?)?\s*/\s*[MFO]\b)", re.I)
+_FREE_AGE_HI_RX = re.compile(r"((?:आयु|उम्र)\s*[:=\-]\s*)(\d{1,3})(\s*(?:वर्ष|साल)(?:\s*/\s*(?:पुरुष|पुरूष|महिला|स्त्री|नर|मादा|अन्य))?)")
 
 
 def _shield_text(text: str) -> tuple[str, list[str]]:
@@ -320,9 +409,118 @@ def _unshield_text(text: str, shields: list[str]) -> str:
 
 
 _COMMA_VILLAGE_RX = re.compile(r"(?m),[ \t]*([^,\n\[\]]{3,35}?)(?=[ \t]*,[ \t]*\[TEHSIL\])")
-_SUPPRESS_DIST_EN_RX = re.compile(r"(?i)\bDistt?\.?[ \t]+[A-Za-z]+(?:[ \t]+[A-Za-z]+){0,2}(?=[ \t]*(?:,|-|\n|$))")
-_SUPPRESS_DIST_HI_RX = re.compile(r"जिला[ \t]+(?!(?:अस्पताल|चिकित्सालय)\b)[\u0900-\u097F]+(?:[ \t]+[\u0900-\u097F]+){0,1}")
+_SUPPRESS_DIST_EN_RX = re.compile(r"(?i)\b(?:Distt?\.?|District)[ \t]*[:.]?[ \t]+[A-Za-z]+(?:[ \t]+[A-Za-z]+){0,2}(?=[ \t]*(?:,|-|\.(?:\s|$)|\n|$))")
+_SUPPRESS_DIST_HI_RX = re.compile(
+    r"(?:जिला|जनपद)[ \t]*[:.]?[ \t]+(?!(?:अस्पताल|चिकित्सालय|मेडिकल[ \t]+कॉलेज)\b)[\u0900-\u097F]+(?:[ \t]+[\u0900-\u097F]+){0,1}(?=[ \t]*(?:,|-|\.|।|\n|$))"
+)
 _FAST_SAFE_TOKEN_RX = re.compile(r"^[A-Za-z_-]{1,36}$")
+_VERHOEFF_AADHAAR_RX = re.compile(r"(?<!\d\.)(?<!\d)([2-9]\d{11})(?!\d)")
+_INLINE_B64_RX = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{24,}={0,2}(?![A-Za-z0-9+/=])")
+_INLINE_HEX_RX = re.compile(r"\b(?:0x)?((?:[0-9a-fA-F]{2}){10,})\b")
+_INLINE_ESC_HINT_RX = re.compile(r"(?:\\u[0-9a-fA-F]{4}|&#(?:\d+|x[0-9a-fA-F]+);|(?:%[0-9a-fA-F]{2}.*){2,})")
+_INLINE_UESC_RX = re.compile(r"\\u([0-9a-fA-F]{4})")
+_INLINE_HTML_RX = re.compile(r"&#(?:\d+|x[0-9a-fA-F]+);")
+_INLINE_PCT_RX = re.compile(r"(?:%[0-9a-fA-F]{2})")
+
+
+def _is_readable_payload(txt: str) -> bool:
+    if not txt or len(txt) < 4:
+        return False
+    bad = sum(1 for ch in txt if ord(ch) < 0x20 and ch not in "\t\r\n")
+    if bad > 0:
+        return False
+    letters = sum(1 for ch in txt if ch.isalnum() or ch.isspace() or ch in ",.;:!?@#/-_()[]'\"")
+    return (letters / len(txt)) >= 0.85
+
+
+def _scrub_inline_encoded_payloads(
+    text: str,
+    stats: DetectionStats,
+    plan: PrivacyPlan | None,
+    hospital_hint: str,
+    preferred_order: str | None,
+    allow_ml_fallback: bool,
+    cluster_redact: tuple[tuple[str, str], ...],
+    decode_depth: int,
+) -> str:
+    """Decode and sanitize inline Base64, hex, \\uXXXX, HTML-entity, and %-encoded segments."""
+    if decode_depth >= 2 or not text:
+        return text
+
+    work = text
+    # 1. Inline Base64 runs (re-encode cleaned payload to keep container intact)
+    if len(work) >= 24 and _INLINE_B64_RX.search(work):
+        def _b64_repl(m: re.Match[str]) -> str:
+            tok = m.group(0)
+            padded = tok + "=" * (-len(tok) % 4)
+            try:
+                raw = base64.b64decode(padded, validate=True)
+                dec = raw.decode("utf-8", errors="strict")
+            except (binascii.Error, UnicodeDecodeError, ValueError):
+                return tok
+            if not _is_readable_payload(dec):
+                return tok
+            cleaned = clean_free_text(
+                dec, stats, plan=plan, hospital_hint=hospital_hint,
+                preferred_order=preferred_order, allow_ml_fallback=allow_ml_fallback,
+                cluster_redact=cluster_redact, _decode_depth=decode_depth + 1,
+            )
+            if cleaned == dec:
+                return tok
+            return base64.b64encode(cleaned.encode("utf-8")).decode("ascii")
+
+        work = _INLINE_B64_RX.sub(_b64_repl, work)
+
+    # 2. Inline Hex strings (>= 10 bytes) encoding printable UTF-8 PII
+    if _INLINE_HEX_RX.search(work):
+        def _hex_repl(m: re.Match[str]) -> str:
+            full = m.group(0)
+            hex_body = m.group(1)
+            try:
+                dec = bytes.fromhex(hex_body).decode("utf-8", errors="strict")
+            except (ValueError, UnicodeDecodeError):
+                return full
+            if not _is_readable_payload(dec):
+                return full
+            cleaned = clean_free_text(
+                dec, stats, plan=plan, hospital_hint=hospital_hint,
+                preferred_order=preferred_order, allow_ml_fallback=allow_ml_fallback,
+                cluster_redact=cluster_redact, _decode_depth=decode_depth + 1,
+            )
+            if cleaned == dec:
+                return full
+            pref = "0x" if full.startswith("0x") else ""
+            return pref + cleaned.encode("utf-8").hex()
+
+        work = _INLINE_HEX_RX.sub(_hex_repl, work)
+
+    # 3. Line-level \uXXXX / HTML numeric entities / %-encoding
+    if _INLINE_ESC_HINT_RX.search(work):
+        out_lines: list[str] = []
+        for line in work.splitlines(keepends=True):
+            if "\x00SHIELD_" in line or not _INLINE_ESC_HINT_RX.search(line):
+                out_lines.append(line)
+                continue
+            dec_line = line
+            if _INLINE_UESC_RX.search(dec_line):
+                dec_line = _INLINE_UESC_RX.sub(lambda m: chr(int(m.group(1), 16)), dec_line)
+            if _INLINE_HTML_RX.search(dec_line):
+                dec_line = html.unescape(dec_line)
+            if len(_INLINE_PCT_RX.findall(dec_line)) >= 2:
+                dec_line = urllib.parse.unquote(dec_line)
+            if dec_line != line and _is_readable_payload(dec_line.strip()):
+                cleaned = clean_free_text(
+                    dec_line, stats, plan=plan, hospital_hint=hospital_hint,
+                    preferred_order=preferred_order, allow_ml_fallback=allow_ml_fallback,
+                    cluster_redact=cluster_redact, _decode_depth=decode_depth + 1,
+                )
+                if cleaned != dec_line:
+                    out_lines.append(cleaned)
+                    continue
+            out_lines.append(line)
+        work = "".join(out_lines)
+
+    return work
 
 
 def _apply_shadow_sub(
@@ -347,11 +545,12 @@ def _apply_shadow_sub(
         raw_sub = text[s:e]
         if "\x00SHIELD_" in raw_sub or f"[{kind}]" in raw_sub:
             continue
-        out.append(text[pos:s])
         rep = replacement_fn(m, raw_sub) if replacement_fn else f"[{kind}]"
+        out.append(text[pos:s])
         out.append(rep)
         pos = e
-        stats.add(kind)
+        if rep != raw_sub:
+            stats.add(kind)
     out.append(text[pos:])
     return "".join(out)
 
@@ -365,6 +564,48 @@ def format_age_band(age: int, band_years: int = 5, max_cap: int = 85) -> str:
     return f"{lo}-{hi}"
 
 
+def _apply_crf_fallback(text: str, stats: DetectionStats) -> str:
+    """Run guarded python-crfsuite fallback on unanchored free-text prose only."""
+    spans = tag_unanchored_person_spans(text)
+    if not spans:
+        return text
+    out: list[str] = []
+    pos = 0
+    for s, e, kind in spans:
+        if s < pos or s >= e:
+            continue
+        raw = text[s:e]
+        if "\x00SHIELD_" in raw or "[" in raw or "]" in raw:
+            continue
+        out.append(text[pos:s])
+        out.append(f"[{kind}]")
+        pos = e
+        stats.add(kind)
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _apply_cluster_redact(
+    text: str,
+    cluster_redact: tuple[tuple[str, str], ...],
+    stats: DetectionStats,
+) -> str:
+    """Scrub already-linked cluster names, relatives, and suppressed QIs after shielding."""
+    if not cluster_redact or not text:
+        return text
+    out = text
+    for kind, surf in sorted(cluster_redact, key=lambda kv: (-len(kv[1]), kv[0], kv[1])):
+        if not surf or len(surf.strip()) < 3:
+            continue
+        esc = re.escape(surf.strip())
+        if surf.isascii():
+            rx = re.compile(rf"(?i)(?<![A-Za-z0-9_]){esc}(?![A-Za-z0-9_])")
+        else:
+            rx = re.compile(rf"(?:(?<=^)|(?<=[\s,.;:!?()\[\]\"'/-])){esc}(?=$|[\s,.;:!?()\[\]\"'/।-])")
+        out = _apply_shadow_sub(out, rx, kind, stats)
+    return out
+
+
 def clean_free_text(
     text: str,
     stats: DetectionStats,
@@ -372,36 +613,72 @@ def clean_free_text(
     clean_only_direct_ids: bool = False,
     hospital_hint: str = "",
     preferred_order: str | None = None,
+    allow_ml_fallback: bool = True,
+    cluster_redact: tuple[tuple[str, str], ...] = (),
+    _decode_depth: int = 0,
 ) -> str:
     """Detect and redact PII in free text while protecting clinical meaning traps."""
     if not text or _FAST_SAFE_TOKEN_RX.fullmatch(text):
         return text
 
+    # Fold zero-width chars, Cyrillic/Greek homoglyphs, and Latin diacritics while keeping Devanagari digits intact
+    work_in = text if text.isascii() else fold_homoglyphs(text, keep_deva_digits=True)
+
     if clean_only_direct_ids:
-        res, direct_shields = _shield_text(text)
-        for kind, rx in _DIRECT_ID_PATTERNS[:9]:  # email, upi, abha, aadhaar, phone, pan, insurance
+        res, direct_shields = _shield_text(work_in)
+        for kind, rx in _DIRECT_ID_PATTERNS:
+            if kind == "MRN":
+                continue
+            if kind == "AADHAAR_LBL":
+                res = _apply_shadow_sub(res, rx, "AADHAAR", stats, group_idx=1)
+                continue
+            if kind == "PHONE":
+                res = _apply_shadow_sub(
+                    res, _VERHOEFF_AADHAAR_RX, "AADHAAR", stats,
+                    replacement_fn=lambda m, raw: "[AADHAAR]" if is_valid_verhoeff(m.group(0)) else raw,
+                )
             res = _apply_shadow_sub(res, rx, kind, stats)
         return _unshield_text(res, direct_shields)
 
     # 1. Shield protected clinical expressions first
-    work, shields = _shield_text(text)
+    work, shields = _shield_text(work_in)
 
-    # 2. Direct structured IDs (shadow-matched across ASCII & Devanagari digits)
+    # 1.5 Inline encoded payloads (base64 / hex / \uXXXX / HTML entities / %-encoding)
+    work = _scrub_inline_encoded_payloads(
+        work, stats, plan, hospital_hint, preferred_order, allow_ml_fallback, cluster_redact, _decode_depth
+    )
+
+    # 2. Direct structured IDs (shadow-matched across ASCII & Devanagari digits; Verhoeff bare Aadhaar before PHONE)
+    verhoeff_done = False
     for kind, rx in _DIRECT_ID_PATTERNS:
+        if kind == "AADHAAR_LBL":
+            work = _apply_shadow_sub(work, rx, "AADHAAR", stats, group_idx=1)
+            continue
+        if kind == "PHONE" and not verhoeff_done:
+            verhoeff_done = True
+            work = _apply_shadow_sub(
+                work, _VERHOEFF_AADHAAR_RX, "AADHAAR", stats,
+                replacement_fn=lambda m, raw: "[AADHAAR]" if is_valid_verhoeff(m.group(0)) else raw,
+            )
         work = _apply_shadow_sub(work, rx, kind, stats)
 
     # Labeled unseen-format MRNs
     work = _apply_shadow_sub(work, _LABELED_ID_RX, "MRN", stats, group_idx=2)
 
     # 3. Context-anchored patient & relative names
+    _non_name_label_vals = frozenset({
+        "unknown", "none", "na", "n/a", "nil", "null", "normal", "stable",
+        "positive", "negative", "pending", "approved", "settled", "routine",
+    })
     for kind, rx, grp in _LABELED_NAME_PATTERNS:
         def _name_rep(m: re.Match[str], raw_sub: str, k: str = kind) -> str:
-            if raw_sub.strip().startswith("[") and raw_sub.strip().endswith("]"):
+            low_sub = raw_sub.strip().casefold()
+            if (raw_sub.strip().startswith("[") and raw_sub.strip().endswith("]")) or low_sub in _non_name_label_vals:
                 return raw_sub
             return f"[{k}]"
         work = _apply_shadow_sub(work, rx, kind, stats, replacement_fn=_name_rep, group_idx=grp)
 
-    # 4. Address components (House, Locality, Landmark, Village, Tehsil, PIN)
+    # 4. Address components (House, Locality, Landmark, Village, Tehsil, PIN) before CRF fallback
     for kind, rx in _ADDRESS_PATTERNS:
         work = _apply_shadow_sub(work, rx, kind, stats)
 
@@ -413,6 +690,14 @@ def clean_free_text(
         stats,
         group_idx=1,
     )
+
+    # 4.5 Guarded python-crfsuite fallback for unanchored multilingual prose names/relatives/locations/IDs
+    if allow_ml_fallback:
+        work = _apply_crf_fallback(work, stats)
+
+    # 4.6 Exact cluster-known names, relatives, and suppressed QIs (shield-protected above)
+    if cluster_redact:
+        work = _apply_cluster_redact(work, cluster_redact, stats)
 
     def _pin_rep(m: re.Match[str], raw_sub: str) -> str:
         digits = raw_sub.translate(_DEVA_DIGITS)
@@ -435,7 +720,11 @@ def clean_free_text(
             is_suppressed=(plan.generalization_level != "standard"),
             preferred_order=preferred_order,
         )
-        work = _shift_month_name_dates(work, plan.date_shift_days)
+        work = _shift_month_name_dates(
+            work,
+            plan.date_shift_days,
+            is_suppressed=(plan.generalization_level != "standard"),
+        )
         work = generalize_ages_in_text(work, plan)
 
     # 6. Restore protected clinical spans
@@ -474,17 +763,18 @@ def shift_dates_in_text(
         parts = re.split(r"[-/.]", tok)
         if len(parts) != 3:
             return tok
-        # Guard ambiguous non-ISO 2-digit year tokens with year < 20 (skip YYYY-MM-DD where parts[2] is day 01..19)
-        if len(parts[0]) != 4 and len(parts[2]) == 2 and int(parts[2]) < 20:
+        # Skip dotted version tokens (1.2.15) unless explicitly on a dated/DOB line
+        line_start = shadow.rfind("\n", 0, m.start()) + 1
+        line_prefix = shadow[line_start:m.start()].lower()
+        is_dated_ctx = any(k in line_prefix for k in ("dob", "birth", "born", "bday", "date", "admis", "admit", "disch", "visit", "reg", "collected", "reported", "जन्म", "तारीख", "दिनांक", "भर्ती", "छुट्टी"))
+        if len(parts[0]) != 4 and len(parts[2]) == 2 and int(parts[2]) < 20 and "." in tok and not is_dated_ctx:
             return tok
         parsed = parse_date_string(tok, preferred_order=preferred)
         if parsed is None or not (1900 <= parsed.year <= 2035):
             return tok
-        # Check line context for DOB
-        line_start = shadow.rfind("\n", 0, m.start()) + 1
-        line_prefix = shadow[line_start:m.start()].lower()
-        if is_suppressed and any(k in line_prefix for k in ("dob", "birth", "जन्म")):
-            return "[DOB]"
+        # Check line context for DOB: truncate to YYYY on standard tier (never shift with clinical dates)
+        if any(k in line_prefix for k in ("dob", "birth", "born", "bday", "janm", "जन्म")):
+            return "[DOB]" if is_suppressed else f"{parsed.year:04d}"
         shifted = parsed + __import__("datetime").timedelta(days=shift_days)
         sep = "-" if "-" in tok else ("." if "." in tok else "/")
         if len(parts[0]) == 4:
@@ -498,11 +788,40 @@ def shift_dates_in_text(
     return date_rx.sub(_repl, shadow)
 
 
-def _shift_month_name_dates(text: str, shift_days: int) -> str:
-    """Shift textual dates such as '5 September' cleanly using privacy.shift_date_token."""
-    from rakshak.privacy import _TEXT_MONTH_DATE_RE, shift_date_token
+def _shift_month_name_dates(text: str, shift_days: int, is_suppressed: bool = False) -> str:
+    """Shift textual dates in a single left-to-right pass (zero double-shifting), redacting DOB if suppressed."""
+    from rakshak.privacy import _TEXT_MONTH_DATE_RE, _US_TEXT_MONTH_DATE_RE, _YMD_TEXT_MONTH_DATE_RE, shift_date_token
 
-    return _TEXT_MONTH_DATE_RE.sub(lambda m: shift_date_token(m.group(0), shift_days), text)
+    out: list[str] = []
+    pos = 0
+    n = len(text)
+    rxs = (_YMD_TEXT_MONTH_DATE_RE, _TEXT_MONTH_DATE_RE, _US_TEXT_MONTH_DATE_RE)
+    while pos < n:
+        best_m: re.Match[str] | None = None
+        for rx in rxs:
+            m = rx.search(text, pos)
+            if m is not None and (
+                best_m is None or m.start() < best_m.start() or (m.start() == best_m.start() and m.end() > best_m.end())
+            ):
+                best_m = m
+        if best_m is None:
+            out.append(text[pos:])
+            break
+        out.append(text[pos:best_m.start()])
+        raw_tok = best_m.group(0)
+        ls = text.rfind("\n", 0, best_m.start()) + 1
+        seg = re.split(r"[|;]", text[ls:best_m.start()])[-1].lower()
+        if any(k in seg for k in ("dob", "birth", "born", "bday", "janm", "जन्म")):
+            if is_suppressed:
+                out.append("[DOB]")
+            else:
+                m_yr = re.search(r"\b((?:19|20)\d{2})\b", raw_tok)
+                out.append(m_yr.group(1) if m_yr else "[DOB]")
+            pos = best_m.end()
+            continue
+        out.append(shift_date_token(raw_tok, shift_days))
+        pos = best_m.end()
+    return "".join(out)
 
 
 def generalize_ages_in_text(text: str, plan: PrivacyPlan) -> str:
@@ -548,6 +867,7 @@ def sanitize_structured_cell(
     plan: PrivacyPlan | None,
     stats: DetectionStats,
     hospital_hint: str = "",
+    cluster_redact: tuple[tuple[str, str], ...] = (),
 ) -> str:
     """Sanitize a single CSV/TSV cell or JSON scalar string using its profiled column/key role."""
     if not value or not value.strip():
@@ -586,9 +906,9 @@ def sanitize_structured_cell(
         stats.add("INSURANCE_ID")
         return "[INSURANCE_ID]"
     if role == ROLE_MRN:
-        # Inject linked pseudonym into primary hospital/patient ID cells (including unseen chaos prefixes)
+        # Inject linked pseudonym into primary hospital/patient ID cells (alphanumeric or pure-digit MRNs)
         stats.add("MRN")
-        if plan and plan.pseudonym and re.search(r"[A-Za-z]{2,8}[/-]?\d{3,}", norm_val):
+        if plan and plan.pseudonym and re.search(r"(?:[A-Za-z]{2,8}[/-]?\d{3,}|^\d{4,12}$)", norm_val):
             return plan.pseudonym
         return "[MRN]"
     if role == ROLE_HOUSE:
@@ -625,12 +945,13 @@ def sanitize_structured_cell(
         if plan is not None and plan.generalization_level != "standard":
             return "[DOB]"
         parsed = parse_date_string(norm_val, preferred_order=date_order)
-        if parsed and plan is not None:
-            shifted = parsed + __import__("datetime").timedelta(days=plan.date_shift_days)
+        if parsed is not None:
             stats.generalized += 1
-            return shifted.isoformat() if date_order == "iso" else (
-                shifted.strftime("%d/%m/%Y") if date_order == "dmy" else shifted.strftime("%m/%d/%Y")
-            )
+            return f"{parsed.year:04d}"
+        m_yr = re.fullmatch(r"(\d{4})", norm_val.translate(_DEVA_DIGITS))
+        if m_yr:
+            stats.generalized += 1
+            return m_yr.group(1)
         return "[DOB]"
     if role in (ROLE_DATE, ROLE_ADMISSION_DATE, ROLE_DISCHARGE_DATE):
         if plan is not None:
@@ -665,7 +986,7 @@ def sanitize_structured_cell(
             stats.generalized += 1
             g_str = "[GENDER]" if (plan is not None and not getattr(plan, "keep_gender", True)) else m.group(2).upper()
             return f"{band}/{g_str}"
-        return clean_free_text(value, stats, plan=plan, hospital_hint=hospital_hint)
+        return clean_free_text(value, stats, plan=plan, hospital_hint=hospital_hint, cluster_redact=cluster_redact)
     if role == ROLE_GENDER:
         if plan is not None and not getattr(plan, "keep_gender", True):
             stats.generalized += 1
@@ -687,4 +1008,4 @@ def sanitize_structured_cell(
             cleaned = _SUPPRESS_DIST_HI_RX.sub("[DISTRICT]", cleaned)
         return cleaned
 
-    return clean_free_text(value, stats, plan=plan, hospital_hint=hospital_hint)
+    return clean_free_text(value, stats, plan=plan, hospital_hint=hospital_hint, cluster_redact=cluster_redact)

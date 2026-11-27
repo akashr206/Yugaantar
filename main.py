@@ -20,10 +20,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable
 
-from rakshak.clue_extractor import extract_clues_for_unit, infer_file_date_orders
+from rakshak.clue_extractor import extract_clues_for_unit, infer_file_date_orders, infer_file_field_roles
 from rakshak.contracts import IdentityClues, PolicyConfig, PrivacyPlan, RecordUnit
 from rakshak.detector import DetectionStats
-from rakshak.formats import build_record_units, render_sanitized_file
+from rakshak.formats import build_cluster_redact_context, build_record_units, render_sanitized_file
 from rakshak.ingest import (
     IngestResult,
     QuarantineError,
@@ -151,7 +151,8 @@ def run_pipeline(
     else:
         plans = plan_fn(all_units, policy, secret)
         date_orders = infer_file_date_orders(all_units)
-        clues = [extract_clues_for_unit(u, date_orders) for u in all_units]
+        field_roles = infer_file_field_roles(all_units)
+        clues = [extract_clues_for_unit(u, date_orders, field_roles=field_roles) for u in all_units]
 
     corpus_common = compute_corpus_common_tokens([it.file_rel for it, _, _ in ingested])
     file_tokens, file_ids, file_has_pii, corpus_ids, corpus_name_pairs = _build_path_pii_context(clues)
@@ -196,8 +197,17 @@ def run_pipeline(
 
     stats = DetectionStats()
     records_out: list[dict] = []
+    redact_ctx = build_cluster_redact_context(clues, plans)
     for item, ctx, entry_idx in resolved_ingested:
-        rendered = render_sanitized_file(item, ctx, plans, records_out, stats, date_orders=date_orders)
+        rendered = render_sanitized_file(
+            item,
+            ctx,
+            plans,
+            records_out,
+            stats,
+            date_orders=date_orders,
+            cluster_redact_context=redact_ctx,
+        )
         dest = san / item.clean_rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(rendered, encoding="utf-8", newline="")

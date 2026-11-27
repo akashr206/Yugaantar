@@ -40,14 +40,36 @@ from rakshak.schema_profiler import (
     classify_column,
     encode_base64_text,
     extract_dates_from_text,
+    header_contains_pii,
     is_clean_reference_file,
     parse_date_string,
+    profile_records_keys,
     profile_table,
     try_decode_base64_text,
 )
 
 _DEVA_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
-_RECORD_ID_KEYS = ("uhid", "patient_ref", "hospital_uhid", "patientid", "patient_id", "reg_no")
+_RECORD_ID_KEYS = (
+    "uhid", "patient_ref", "hospital_uhid", "patientid", "patient_id",
+    "reg_no", "mrn", "ipd_no", "opd_no", "member_id", "subscriber_id",
+)
+_RELATIVE_CONTAINER_KEYS = frozenset({
+    "guardian", "kin", "nominee", "next_of_kin", "spouse", "attendant", "relative", "father", "mother",
+})
+_FHIR_SUBJECT_RESOURCE_TYPES = frozenset({
+    "Composition", "Observation", "Condition", "Encounter", "DiagnosticReport",
+    "MedicationRequest", "Procedure", "DocumentReference", "AllergyIntolerance",
+    "Specimen", "CarePlan", "Immunization", "ImagingStudy", "ServiceRequest",
+    "RelatedPerson",
+})
+_SAFE_PATH_TOKENS = frozenset({
+    "data", "srv", "var", "tmp", "opt", "home", "usr", "export", "exports", "backup", "backups",
+    "archive", "archives", "raw", "clean", "records", "patient", "patients", "report", "reports",
+    "billing", "claims", "registration", "registry", "lab", "labs", "discharge", "prescriptions",
+    "prescription", "fhir", "bundle", "clinical", "ward", "census", "drug", "formulary",
+    "reference", "ranges", "protocol", "guideline", "summary", "health", "hospital", "clinic",
+    "notes", "note", "helpdesk", "inbox", "outbox", "files", "file", "json", "csv", "tsv",
+})
 
 
 def _record_status(plan: PrivacyPlan) -> str:
@@ -137,10 +159,15 @@ def _is_doc_json_container(data: Any) -> bool:
         return True
     if data.get("resourceType") == "Bundle":
         return True
-    # Single-patient diagnostic reports (have top-level "patient" dict or "panels") or helpdesk docs
-    if isinstance(data.get("patient"), dict) or "panels" in data or "tickets" in data:
+    # Single-patient diagnostic reports (top-level "patient" dict) or single-ticket docs
+    if isinstance(data.get("patient"), dict):
         return True
-    return not any(isinstance(v, list) and v and all(isinstance(x, dict) for x in v) for v in data.values())
+    list_keys = [k for k, v in data.items() if isinstance(v, list) and v and all(isinstance(x, dict) for x in v)]
+    if "panels" in list_keys and len(list_keys) == 1:
+        return True
+    if isinstance(data.get("tickets"), list) and len(data["tickets"]) <= 1 and len(list_keys) <= 1:
+        return True
+    return not list_keys
 
 
 def build_record_units(item: IngestResult) -> tuple[list[RecordUnit], dict[str, Any]]:
@@ -243,6 +270,10 @@ def _sanitize_json_scalar(
     inside_practitioner: bool = False,
     parent_key: str = "",
     file_date_orders: dict[str, str] | None = None,
+    cluster_redact: tuple[tuple[str, str], ...] = (),
+    path_redact_tokens: frozenset[str] = frozenset(),
+    field_roles: dict[str, Any] | None = None,
+    key_path: str = "",
 ) -> Any:
     """Sanitize a scalar JSON leaf while keeping value types valid where required."""
     if clean_doc:
@@ -260,6 +291,10 @@ def _sanitize_json_scalar(
         return val
 
     prof = classify_column(key, [str(val)] if val is not None else [], hospital_hint=hospital_hint)
+    if prof.role == ROLE_UNKNOWN and field_roles:
+        pooled_prof = (field_roles.get(key_path) if key_path else None) or field_roles.get(key)
+        if pooled_prof is not None and pooled_prof.role != ROLE_UNKNOWN:
+            prof = pooled_prof
     is_suppressed = plan is not None and plan.generalization_level == "suppressed"
 
     # Handle numeric PII/quasi-identifiers (e.g. integer Aadhaar in dhh_patients.json or integer age)
@@ -288,10 +323,10 @@ def _sanitize_json_scalar(
     if not isinstance(val, str):
         return val
 
-    # Semantic overrides for nested JSON person/guardian sub-fields
-    if low_parent == "name" and low_key == "local":
+    # Semantic overrides for nested JSON person/guardian/kin sub-fields
+    if low_parent == "name" and low_key in ("local", "full"):
         return sanitize_structured_cell(val, ROLE_PATIENT_NAME, "dmy", plan, stats, hospital_hint=hospital_hint)
-    if low_parent == "guardian" and low_key == "name":
+    if low_parent in _RELATIVE_CONTAINER_KEYS and low_key == "name":
         return sanitize_structured_cell(val, ROLE_RELATIVE_NAME, "dmy", plan, stats, hospital_hint=hospital_hint)
 
     # Protect structural UUIDs/URNs/HTTP ontology URLs from ID-regex corruption
@@ -304,16 +339,45 @@ def _sanitize_json_scalar(
     # Base64 attachments (e.g. scanned_consent_form.json, FHIR DocumentReference)
     decoded_b64 = try_decode_base64_text(val)
     if decoded_b64 is not None:
-        cleaned_inner = clean_free_text(decoded_b64, stats, plan=plan, hospital_hint=hospital_hint)
+        cleaned_inner = clean_free_text(
+            decoded_b64, stats, plan=plan, hospital_hint=hospital_hint, cluster_redact=cluster_redact
+        )
         return encode_base64_text(cleaned_inner)
 
-    # _export_meta.source_path special scrub (e.g. D:\HIS\exports\opd\Anita_Sharma_010565\visits_2026_02.json)
+    # _export_meta.source_path / file_path generic segment scrub (works for any folder depth or extension)
     if low_key in ("source_path", "export_path", "file_path"):
-        stats.add("PATIENT_NAME")
-        return re.sub(r"([\\/])[^\\/]+([\\/][^\\/]+\.json)$", r"\1[REDACTED]\2", val)
+        parts = re.split(r"([\\/]+)", val)
+        out_parts: list[str] = []
+        for idx, seg in enumerate(parts):
+            if not seg or re.fullmatch(r"[\\/]+", seg) or re.fullmatch(r"[A-Za-z]:", seg):
+                out_parts.append(seg)
+                continue
+            is_last = idx == len(parts) - 1
+            stem, ext = (seg.rsplit(".", 1)[0], "." + seg.rsplit(".", 1)[1]) if (is_last and "." in seg) else (seg, "")
+            seg_toks = [w.lower() for w in re.split(r"[^A-Za-z0-9]+", stem) if len(w) >= 3 and w.isalpha()]
+            has_known_tok = bool(path_redact_tokens) and any(t in path_redact_tokens for t in seg_toks)
+            cleaned_seg = clean_free_text(stem, stats, plan=None, hospital_hint=hospital_hint, allow_ml_fallback=False)
+            if cleaned_seg != stem:
+                out_parts.append("[REDACTED]" + ext)
+            elif (
+                has_known_tok
+                or header_contains_pii(stem)
+                or re.search(r"(?:[A-Z][a-z]+_[A-Z][a-z]+|\d{6,})", stem)
+                or (is_last and ("_" in stem or "-" in stem) and len(seg_toks) >= 2 and any(t not in _SAFE_PATH_TOKENS for t in seg_toks))
+            ):
+                stats.add("PATIENT_NAME")
+                out_parts.append("[REDACTED]" + ext)
+            else:
+                out_parts.append(seg)
+        return "".join(out_parts)
 
     # JSON keys that hold patient identifiers directly
-    if prof.role == ROLE_MRN and low_key in _RECORD_ID_KEYS:
+    if prof.role == ROLE_MRN and (
+        low_key in _RECORD_ID_KEYS
+        or "mrn" in low_key
+        or "uhid" in low_key
+        or (field_roles is not None and not any(x in low_key for x in ("bill", "sample")))
+    ):
         stats.add("MRN")
         return plan.pseudonym if (plan and plan.pseudonym) else "[MRN]"
 
@@ -326,17 +390,26 @@ def _sanitize_json_scalar(
             low_k = key.lower()
             if not any(h in low_k for h in ("mm/dd", "dd/mm", "yyyy-mm-dd", "mdy", "dmy", "iso")):
                 resolved_order = file_date_orders.get(key) or file_date_orders.get("__doc__") or prof.date_order
-        return sanitize_structured_cell(val, prof.role, resolved_order, plan, stats, hospital_hint=hospital_hint)
+        return sanitize_structured_cell(
+            val, prof.role, resolved_order, plan, stats, hospital_hint=hospital_hint, cluster_redact=cluster_redact
+        )
 
     doc_order = file_date_orders.get("__doc__") if file_date_orders else None
-    return clean_free_text(val, stats, plan=plan, hospital_hint=hospital_hint, preferred_order=doc_order)
+    return clean_free_text(
+        val,
+        stats,
+        plan=plan,
+        hospital_hint=hospital_hint,
+        preferred_order=doc_order,
+        cluster_redact=cluster_redact,
+    )
 
 
 @lru_cache(maxsize=4096)
 def _clean_json_key_cached(k: str, hospital_hint: str) -> tuple[str, tuple[tuple[str, int], ...]]:
     tmp_stats = DetectionStats()
-    c = clean_free_text(k, tmp_stats, plan=None, hospital_hint=hospital_hint)
-    if c == k and re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}", k.strip()):
+    c = clean_free_text(k, tmp_stats, plan=None, hospital_hint=hospital_hint, allow_ml_fallback=False)
+    if c == k and header_contains_pii(k):
         tmp_stats.add("PATIENT_NAME")
         c = "[PATIENT_NAME]"
     return c, tuple(tmp_stats.by_type.items())
@@ -349,6 +422,9 @@ def _sanitize_json_iterative(
     hospital_hint: str,
     clean_doc: bool,
     file_date_orders: dict[str, str] | None = None,
+    cluster_redact: tuple[tuple[str, str], ...] = (),
+    path_redact_tokens: frozenset[str] = frozenset(),
+    field_roles: dict[str, Any] | None = None,
 ) -> Any:
     """Iteratively sanitize a JSON container without Python recursion limits."""
     def _clean_key(k: str) -> str:
@@ -360,18 +436,25 @@ def _sanitize_json_iterative(
         return c
 
     if not isinstance(root, (dict, list)):
-        return _sanitize_json_scalar("", root, plan, stats, hospital_hint, clean_doc, file_date_orders=file_date_orders)
+        return _sanitize_json_scalar(
+            "", root, plan, stats, hospital_hint, clean_doc,
+            file_date_orders=file_date_orders,
+            cluster_redact=cluster_redact,
+            path_redact_tokens=path_redact_tokens,
+            field_roles=field_roles,
+        )
 
     new_root: Any = {} if isinstance(root, dict) else []
-    # Stack items: (src_node, dst_node, parent_key, inside_protected_resource)
-    stack: list[tuple[Any, Any, str, bool]] = [(root, new_root, "", False)]
+    # Stack items: (src_node, dst_node, parent_key, key_path, inside_protected_resource)
+    stack: list[tuple[Any, Any, str, str, bool]] = [(root, new_root, "", "", False)]
 
     while stack:
-        src, dst, pkey, in_prac = stack.pop()
+        src, dst, pkey, cpath, in_prac = stack.pop()
         if isinstance(src, dict):
             rtype = src.get("resourceType")
             is_prac_obj = in_prac or rtype in ("Practitioner", "Organization")
             for raw_k, v in src.items():
+                rel_path = f"{cpath}.{raw_k}" if cpath else raw_k
                 ck = _clean_key(raw_k)
                 # Ensure unique key if multiple PII keys collapse to "[PATIENT_NAME]" or "[MRN]"
                 if ck != raw_k and ck in dst:
@@ -382,11 +465,11 @@ def _sanitize_json_iterative(
                 if isinstance(v, dict):
                     child: dict[str, Any] = {}
                     dst[ck] = child
-                    stack.append((v, child, raw_k, is_prac_obj))
+                    stack.append((v, child, raw_k, rel_path, is_prac_obj))
                 elif isinstance(v, list):
                     child_list: list[Any] = []
                     dst[ck] = child_list
-                    stack.append((v, child_list, raw_k, is_prac_obj))
+                    stack.append((v, child_list, raw_k, rel_path, is_prac_obj))
                 else:
                     dst[ck] = _sanitize_json_scalar(
                         raw_k,
@@ -398,17 +481,22 @@ def _sanitize_json_iterative(
                         inside_practitioner=is_prac_obj,
                         parent_key=pkey,
                         file_date_orders=file_date_orders,
+                        cluster_redact=cluster_redact,
+                        path_redact_tokens=path_redact_tokens,
+                        field_roles=field_roles,
+                        key_path=rel_path,
                     )
         elif isinstance(src, list):
+            arr_path = f"{cpath}[]" if cpath else "[]"
             for item in src:
                 if isinstance(item, dict):
                     child_d: dict[str, Any] = {}
                     dst.append(child_d)
-                    stack.append((item, child_d, pkey, in_prac))
+                    stack.append((item, child_d, pkey, arr_path, in_prac))
                 elif isinstance(item, list):
                     child_l: list[Any] = []
                     dst.append(child_l)
-                    stack.append((item, child_l, pkey, in_prac))
+                    stack.append((item, child_l, pkey, arr_path, in_prac))
                 else:
                     dst.append(
                         _sanitize_json_scalar(
@@ -421,6 +509,10 @@ def _sanitize_json_iterative(
                             inside_practitioner=in_prac,
                             parent_key=pkey,
                             file_date_orders=file_date_orders,
+                            cluster_redact=cluster_redact,
+                            path_redact_tokens=path_redact_tokens,
+                            field_roles=field_roles,
+                            key_path=arr_path,
                         )
                     )
     return new_root
@@ -432,9 +524,20 @@ def _sanitize_fhir_bundle(
     stats: DetectionStats,
     hospital_hint: str,
     file_date_orders: dict[str, str] | None = None,
+    cluster_redact: tuple[tuple[str, str], ...] = (),
+    path_redact_tokens: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Sanitize a FHIR R4 Document Bundle while keeping references valid and Patient PSN injected."""
-    cleaned = _sanitize_json_iterative(bundle, plan, stats, hospital_hint, clean_doc=False, file_date_orders=file_date_orders)
+    cleaned = _sanitize_json_iterative(
+        bundle,
+        plan,
+        stats,
+        hospital_hint,
+        clean_doc=False,
+        file_date_orders=file_date_orders,
+        cluster_redact=cluster_redact,
+        path_redact_tokens=path_redact_tokens,
+    )
     if not isinstance(cleaned, dict):
         return cleaned
 
@@ -452,11 +555,34 @@ def _sanitize_fhir_bundle(
         if not isinstance(res, dict):
             continue
         rtype = res.get("resourceType")
-        if rtype == "Composition":
-            subj = res.get("subject")
-            if isinstance(subj, dict) and "display" in subj:
-                stats.add("PATIENT_NAME")
-                subj["display"] = psn if psn else "[PATIENT_NAME]"
+        if rtype in _FHIR_SUBJECT_RESOURCE_TYPES:
+            for ref_key in ("subject", "patient"):
+                subj = res.get(ref_key)
+                if isinstance(subj, dict) and isinstance(subj.get("display"), str):
+                    stats.add("PATIENT_NAME")
+                    subj["display"] = psn if psn else "[PATIENT_NAME]"
+        if rtype == "RelatedPerson":
+            stats.add("RELATIVE_NAME")
+            res["name"] = [{"text": "[RELATIVE_NAME]"}]
+            res.pop("birthDate", None)
+            if isinstance(res.get("telecom"), list):
+                for tc in res["telecom"]:
+                    if isinstance(tc, dict) and isinstance(tc.get("value"), str):
+                        sys_low = str(tc.get("system", "")).lower()
+                        kind = "EMAIL" if sys_low == "email" or "@" in tc["value"] else "PHONE"
+                        stats.add(kind)
+                        tc["value"] = f"[{kind}]"
+            if isinstance(res.get("address"), list):
+                for a in res["address"]:
+                    if isinstance(a, dict):
+                        a.pop("line", None)
+                        a.pop("city", None)
+                        a.pop("text", None)
+                        if not plan.keep_district:
+                            a["district"] = "[DISTRICT]"
+                        if "postalCode" in a:
+                            pc = str(a["postalCode"]).translate(_DEVA_DIGITS)
+                            a["postalCode"] = f"{pc[:3]}***" if (plan.keep_pin_prefix and len(pc) >= 3) else "[PIN]"
         elif rtype == "Patient":
             # Replace identifiers with clean pseudonym identifier (keep FHIR identifier array valid)
             res["identifier"] = [
@@ -473,12 +599,17 @@ def _sanitize_fhir_bundle(
                         kind = "EMAIL" if sys_low == "email" or "@" in tc["value"] else "PHONE"
                         stats.add(kind)
                         tc["value"] = f"[{kind}]"
-            # Suppress Patient.birthDate by omitting the optional element on widened/suppressed tiers (keeps valid FHIR R4)
-            if "birthDate" in res and (
-                plan.generalization_level != "standard"
-                or not re.fullmatch(r"\d{4}(?:-\d{2}(?:-\d{2})?)?", str(res["birthDate"]))
-            ):
-                res.pop("birthDate", None)
+            # Truncate Patient.birthDate to birth year (YYYY) on standard tier (never shift DOB); omit on widened/suppressed tiers
+            if "birthDate" in res:
+                if plan.generalization_level != "standard":
+                    res.pop("birthDate", None)
+                else:
+                    m_yr = re.match(r"^(\d{4})\b", str(res["birthDate"]).strip())
+                    if m_yr:
+                        res["birthDate"] = m_yr.group(1)
+                        stats.generalized += 1
+                    else:
+                        res.pop("birthDate", None)
             if not getattr(plan, "keep_gender", True):
                 res["gender"] = "unknown"
             # Sanitize narrative div cleanly
@@ -532,6 +663,49 @@ def _sanitize_fhir_bundle(
     return cleaned
 
 
+def build_cluster_redact_context(
+    clues: list[Any],
+    plans: dict[str, PrivacyPlan],
+) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict[str, frozenset[str]]]:
+    """Precompute per-unit cluster redaction surfaces (names/relatives/suppressed QIs) & path tokens."""
+    cluster_names: dict[str, set[tuple[str, str]]] = {}
+    file_tokens: dict[str, set[str]] = {}
+    for c in clues:
+        plan = plans.get(c.unit_id)
+        ckey = (plan.cluster_key if plan and plan.cluster_key else None) or c.unit_id
+        bucket = cluster_names.setdefault(ckey, set())
+        ftoks = file_tokens.setdefault(c.file_rel, set())
+        for nc in c.patient_names:
+            raw = nc.raw.strip()
+            if len(raw) >= 4 and (" " in raw or len(nc.latin_tokens) >= 2 or len(raw) >= 5):
+                bucket.add(("PATIENT_NAME", raw))
+            for tok in nc.latin_tokens:
+                if len(tok) >= 4:
+                    ftoks.add(tok)
+        for rc in c.relative_names:
+            raw = rc.raw.strip()
+            if len(raw) >= 4:
+                bucket.add(("RELATIVE_NAME", raw))
+            for tok in rc.latin_tokens:
+                if len(tok) >= 4:
+                    ftoks.add(tok)
+        if c.district_norm and len(c.district_norm) >= 4:
+            ftoks.add(c.district_norm)
+
+    unit_redact: dict[str, tuple[tuple[str, str], ...]] = {}
+    for c in clues:
+        plan = plans.get(c.unit_id)
+        ckey = (plan.cluster_key if plan and plan.cluster_key else None) or c.unit_id
+        pairs = set(cluster_names.get(ckey, set()))
+        if plan is not None and not plan.keep_district and c.district_norm and len(c.district_norm) >= 4:
+            pairs.add(("DISTRICT", c.district_norm))
+        if plan is not None and not plan.keep_pin_prefix and c.pin and len(c.pin) == 6:
+            pairs.add(("PIN", c.pin))
+        unit_redact[c.unit_id] = tuple(sorted(pairs))
+
+    return unit_redact, {k: frozenset(v) for k, v in file_tokens.items()}
+
+
 def render_sanitized_file(
     item: IngestResult,
     ctx: dict[str, Any],
@@ -539,12 +713,18 @@ def render_sanitized_file(
     records_out: list[dict[str, Any]],
     stats: DetectionStats,
     date_orders: dict[tuple[str, str], str] | None = None,
+    clues: list[Any] | None = None,
+    cluster_redact_context: tuple[dict[str, tuple[tuple[str, str], ...]], dict[str, frozenset[str]]] | None = None,
 ) -> str:
     """Render one sanitized file and append its records.jsonl entries."""
     rel = item.file_rel
     out_rel = item.clean_rel
     clean_doc: bool = bool(ctx.get("clean_doc", False))
     file_orders = {fk: ord_v for (frel, fk), ord_v in (date_orders or {}).items() if frel == rel}
+    if cluster_redact_context is None and clues is not None:
+        cluster_redact_context = build_cluster_redact_context(clues, plans)
+    unit_redact_map, file_path_tok_map = cluster_redact_context or ({}, {})
+    path_toks = file_path_tok_map.get(rel, frozenset())
 
     if item.format_type in ("csv", "tsv"):
         delim, header, body = item.parsed
@@ -587,11 +767,25 @@ def render_sanitized_file(
                         col_order = file_orders.get(prof.raw_name, prof.date_order)
                         cleaned_row.append(
                             sanitize_structured_cell(
-                                cell, prof.role, col_order, plan, stats, hospital_hint=item.hospital_hint
+                                cell,
+                                prof.role,
+                                col_order,
+                                plan,
+                                stats,
+                                hospital_hint=item.hospital_hint,
+                                cluster_redact=unit_redact_map.get(f"{rel}::{loc}", ()),
                             )
                         )
                     else:
-                        cleaned_row.append(clean_free_text(cell, stats, plan=plan, hospital_hint=item.hospital_hint))
+                        cleaned_row.append(
+                            clean_free_text(
+                                cell,
+                                stats,
+                                plan=plan,
+                                hospital_hint=item.hospital_hint,
+                                cluster_redact=unit_redact_map.get(f"{rel}::{loc}", ()),
+                            )
+                        )
                 # Ensure linked pseudonym appears inside the exported record
                 if plan.pseudonym and id_col_idx is not None and id_col_idx < len(cleaned_row):
                     cleaned_row[id_col_idx] = plan.pseudonym
@@ -615,7 +809,15 @@ def render_sanitized_file(
         is_doc: bool = bool(ctx.get("is_doc", True))
         if item.format_type == "fhir":
             plan = plans[f"{rel}::doc"]
-            out_obj = _sanitize_fhir_bundle(data, plan, stats, item.hospital_hint, file_date_orders=file_orders)
+            out_obj = _sanitize_fhir_bundle(
+                data,
+                plan,
+                stats,
+                item.hospital_hint,
+                file_date_orders=file_orders,
+                cluster_redact=unit_redact_map.get(f"{rel}::doc", ()),
+                path_redact_tokens=path_toks,
+            )
             records_out.append(
                 {
                     "file": f"sanitized/{out_rel}",
@@ -628,15 +830,31 @@ def render_sanitized_file(
 
         if is_doc:
             plan = plans[f"{rel}::doc"]
-            out_obj = _sanitize_json_iterative(data, plan, stats, item.hospital_hint, clean_doc, file_date_orders=file_orders)
+            out_obj = _sanitize_json_iterative(
+                data,
+                plan,
+                stats,
+                item.hospital_hint,
+                clean_doc,
+                file_date_orders=file_orders,
+                cluster_redact=unit_redact_map.get(f"{rel}::doc", ()),
+                path_redact_tokens=path_toks,
+            )
             if not clean_doc and plan.pseudonym and isinstance(out_obj, dict):
-                # Inject pseudonym into patient sub-object or top-level ref without changing key structure wildly
-                if isinstance(out_obj.get("patient"), dict) and "hospital_uhid" in out_obj["patient"]:
-                    out_obj["patient"]["hospital_uhid"] = plan.pseudonym
-                elif "patient_ref" in out_obj:
-                    out_obj["patient_ref"] = plan.pseudonym
+                # Inject pseudonym into existing patient/MRN key first, else add patient_pseudonym
+                if isinstance(out_obj.get("patient"), dict):
+                    pt_d = out_obj["patient"]
+                    id_k = next((rk for rk in _RECORD_ID_KEYS if rk in pt_d), None)
+                    if id_k:
+                        pt_d[id_k] = plan.pseudonym
+                    else:
+                        pt_d["patient_pseudonym"] = plan.pseudonym
                 else:
-                    out_obj["patient_pseudonym"] = plan.pseudonym
+                    top_k = next((rk for rk in _RECORD_ID_KEYS if rk in out_obj), None)
+                    if top_k:
+                        out_obj[top_k] = plan.pseudonym
+                    else:
+                        out_obj["patient_pseudonym"] = plan.pseudonym
             rec_entry = {
                 "file": f"sanitized/{out_rel}",
                 "loc": "doc",
@@ -648,23 +866,49 @@ def render_sanitized_file(
             return json.dumps(out_obj, ensure_ascii=False, indent=2) + "\n"
 
         # Multi-record JSON (e.g. opd/*.json, registration/dhh_patients.json, lab/bulk_lab_export.json)
-        out_root = _sanitize_json_iterative(data, None, stats, item.hospital_hint, clean_doc, file_date_orders=file_orders)
-        # Re-sanitize each record item with its specific RecordUnit PrivacyPlan
+        out_root = _sanitize_json_iterative(
+            data,
+            None,
+            stats,
+            item.hospital_hint,
+            clean_doc,
+            file_date_orders=file_orders,
+            path_redact_tokens=path_toks,
+        )
+        # Re-sanitize each record item with its specific RecordUnit PrivacyPlan & pooled array roles
         for k, v in list(data.items()):
             if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                arr_roles = profile_records_keys(v, hospital_hint=item.hospital_hint)
                 pointer_key = k.replace("~", "~0").replace("/", "~1")
                 sanitized_list: list[Any] = []
                 for i, item_dict in enumerate(v):
                     loc = f"/{pointer_key}/{i}"
                     plan = plans[f"{rel}::{loc}"]
                     cleaned_item = _sanitize_json_iterative(
-                        item_dict, plan, stats, item.hospital_hint, clean_doc, file_date_orders=file_orders
+                        item_dict,
+                        plan,
+                        stats,
+                        item.hospital_hint,
+                        clean_doc,
+                        file_date_orders=file_orders,
+                        cluster_redact=unit_redact_map.get(f"{rel}::{loc}", ()),
+                        path_redact_tokens=path_toks,
+                        field_roles=arr_roles,
                     )
                     if not clean_doc and plan.pseudonym and isinstance(cleaned_item, dict):
-                        if "patient_ref" in cleaned_item:
-                            cleaned_item["patient_ref"] = plan.pseudonym
-                        elif "uhid" in cleaned_item:
-                            cleaned_item["uhid"] = plan.pseudonym
+                        id_k = next((rk for rk in _RECORD_ID_KEYS if rk in cleaned_item), None)
+                        if id_k is None:
+                            id_k = next(
+                                (
+                                    cand_k
+                                    for cand_k in cleaned_item
+                                    if arr_roles.get(cand_k) and arr_roles[cand_k].role == ROLE_MRN
+                                    and not any(x in cand_k.lower() for x in ("bill", "sample"))
+                                ),
+                                None,
+                            )
+                        if id_k:
+                            cleaned_item[id_k] = plan.pseudonym
                         else:
                             cleaned_item["patient_pseudonym"] = plan.pseudonym
                     sanitized_list.append(cleaned_item)
@@ -688,6 +932,7 @@ def render_sanitized_file(
         clean_only_direct_ids=clean_doc,
         hospital_hint=item.hospital_hint,
         preferred_order=file_orders.get("__doc__"),
+        cluster_redact=() if clean_doc else unit_redact_map.get(f"{rel}::doc", ()),
     )
     if not clean_doc and plan.pseudonym:
         cleaned_txt = f"Patient: {plan.pseudonym}\n{cleaned_txt}"
